@@ -15,12 +15,22 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.tl.custom import Dialog, Message
 
 INDEX_CUSTOM_EMOJI = "🟢"
 INDEX_CUSTOM_EMOJI_ID = 6298751564592973547
+INDEX_TITLE_SUFFIX = " | Demo"
+ASCII_BANNER = r"""
+   ________                     __   ______            _
+  / ____/ /_  ____ _____  ____  / /  / ____/___  ____  (_)__  _____
+ / /   / __ \/ __ `/ __ \/ __ \/ /  / /   / __ \/ __ \/ / _ \/ ___/
+/ /___/ / / / /_/ / / / / / / / /  / /___/ /_/ / /_/ / /  __/ /
+\____/_/ /_/\__,_/_/ /_/_/ /_/_/   \____/\____/ .___/_/\___/_/
+                                               /_/
+"""
 INDEX_STICKER = types.InputDocument(
     id=6016935932551241313,
     access_hash=-7366320401303529044,
@@ -38,13 +48,43 @@ class IndexEntry:
     url: str
 
 
+def show_banner() -> None:
+    """Initialize terminal colors and display the startup banner."""
+    colorama_init(autoreset=True)
+    print(Fore.GREEN + Style.BRIGHT + ASCII_BANNER)
+    print(Fore.CYAN + Style.BRIGHT + "  TELETHON PHOTO MIGRATION CONSOLE")
+    print(Fore.BLUE + "  Captions | Albums | Spoilers | Replies | Index\n")
+
+
+def info(message: str) -> None:
+    """Print an informational terminal message."""
+    print(Fore.CYAN + f"[i] {message}")
+
+
+def success(message: str) -> None:
+    """Print a successful terminal message."""
+    print(Fore.GREEN + f"[+] {message}")
+
+
+def warning(message: str) -> None:
+    """Print a warning terminal message."""
+    print(Fore.YELLOW + f"[!] {message}")
+
+
+def failure(message: str) -> None:
+    """Print a failed terminal message."""
+    print(Fore.RED + f"[-] {message}")
+
+
 def read_credentials() -> tuple[int, str, str]:
     """Read Telegram API credentials from .env or prompt for missing values."""
     load_dotenv()
 
-    raw_api_id = os.getenv("TELEGRAM_API_ID") or input("Telegram API ID: ").strip()
+    raw_api_id = os.getenv("TELEGRAM_API_ID") or input(
+        Fore.CYAN + "Telegram API ID: "
+    ).strip()
     api_hash = os.getenv("TELEGRAM_API_HASH") or getpass.getpass(
-        "Telegram API hash: "
+        Fore.CYAN + "Telegram API hash: "
     ).strip()
     session = os.getenv("TELEGRAM_SESSION", "channel_copier").strip()
 
@@ -91,21 +131,29 @@ def choose_channel(prompt: str, dialogs: Sequence[Dialog]) -> Dialog:
     if not dialogs:
         raise RuntimeError("No eligible channels were found for this account.")
 
-    print(f"\n{prompt}")
+    print(Fore.YELLOW + Style.BRIGHT + f"\n== {prompt.upper()} ==")
     for number, dialog in enumerate(dialogs, start=1):
-        print(f"  {number:>3}. {channel_label(dialog)}")
+        print(
+            Fore.GREEN
+            + Style.BRIGHT
+            + f"  [{number:>3}] "
+            + Fore.WHITE
+            + channel_label(dialog)
+        )
 
     while True:
-        raw_choice = input("Choose a number: ").strip()
+        raw_choice = input(Fore.CYAN + "Select channel number > ").strip()
         try:
             choice = int(raw_choice)
         except ValueError:
-            print("Enter one of the numbers shown above.")
+            warning("Enter one of the channel numbers shown above.")
             continue
 
         if 1 <= choice <= len(dialogs):
-            return dialogs[choice - 1]
-        print("Enter one of the numbers shown above.")
+            selected = dialogs[choice - 1]
+            success(f"Selected: {channel_label(selected)}")
+            return selected
+        warning("Enter one of the channel numbers shown above.")
 
 
 async def iter_photo_groups(
@@ -268,11 +316,11 @@ async def copy_text_replies(
                 break
             except errors.FloodWaitError as exc:
                 wait_seconds = exc.seconds + 1
-                print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+                warning(f"Telegram rate limit: waiting {wait_seconds} seconds...")
                 await asyncio.sleep(wait_seconds)
             except Exception as exc:  # Keep copying after one malformed reply.
                 failed += 1
-                print(f"  Failed text reply {message.id}: {exc}")
+                failure(f"Text reply {message.id} failed: {exc}")
                 break
 
     return copied, failed
@@ -286,10 +334,39 @@ def caption_position(messages: Sequence[Message]) -> int | None:
     return None
 
 
+def is_emoji_character(character: str) -> bool:
+    """Return whether a character belongs to a common Unicode emoji range."""
+    codepoint = ord(character)
+    return (
+        codepoint in {0x00A9, 0x00AE, 0x200D, 0x203C, 0x2049, 0x20E3, 0x2122}
+        or 0x2190 <= codepoint <= 0x21FF
+        or 0x2300 <= codepoint <= 0x23FF
+        or 0x2460 <= codepoint <= 0x24FF
+        or 0x25A0 <= codepoint <= 0x27BF
+        or 0x2B00 <= codepoint <= 0x2BFF
+        or 0x1F000 <= codepoint <= 0x1FAFF
+        or 0xE0020 <= codepoint <= 0xE007F
+        or 0xFE00 <= codepoint <= 0xFE0F
+    )
+
+
+def remove_caption_emoji(value: str) -> str:
+    """Remove ordinary emoji and normalize whitespace for an index title."""
+    characters: list[str] = []
+    for character in value:
+        if ord(character) == 0x20E3 and characters:
+            if characters[-1] in "#*0123456789":
+                characters.pop()
+            continue
+        if not is_emoji_character(character):
+            characters.append(character)
+    return " ".join("".join(characters).split())
+
+
 def first_caption_line(caption: str) -> str | None:
-    """Extract the literal first line of a caption for the final index."""
+    """Extract an emoji-free first caption line for the final index."""
     lines = caption.splitlines()
-    first_line = lines[0].strip() if lines else ""
+    first_line = remove_caption_emoji(lines[0]) if lines else ""
     return first_line or None
 
 
@@ -324,7 +401,8 @@ def make_index_messages(
         return finished_text, [blockquote, *line_entities]
 
     for entry in entries:
-        addition = f"{INDEX_CUSTOM_EMOJI} {entry.title}\n"
+        display_title = f"{entry.title}{INDEX_TITLE_SUFFIX}"
+        addition = f"{INDEX_CUSTOM_EMOJI} {display_title}\n"
         if entry_count and (
             utf16_length(text + addition) > max_units
             or entry_count >= max_entries
@@ -336,7 +414,7 @@ def make_index_messages(
 
         line_offset = utf16_length(text)
         title_offset = line_offset + utf16_length(f"{INDEX_CUSTOM_EMOJI} ")
-        title_length = utf16_length(entry.title)
+        title_length = utf16_length(display_title)
         line_entities.extend(
             [
                 types.MessageEntityCustomEmoji(
@@ -381,7 +459,7 @@ async def post_index(
             break
         except errors.FloodWaitError as exc:
             wait_seconds = exc.seconds + 1
-            print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+            warning(f"Telegram rate limit: waiting {wait_seconds} seconds...")
             await asyncio.sleep(wait_seconds)
 
     count = 0
@@ -397,7 +475,7 @@ async def post_index(
                 break
             except errors.FloodWaitError as exc:
                 wait_seconds = exc.seconds + 1
-                print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+                warning(f"Telegram rate limit: waiting {wait_seconds} seconds...")
                 await asyncio.sleep(wait_seconds)
         count += 1
     return count
@@ -417,8 +495,8 @@ async def run_copy(client: TelegramClient) -> None:
 
     source = source_dialog.entity
     destination = destination_dialog.entity
-    print(
-        f"\nCopying photos from {source_dialog.name} to {destination_dialog.name}..."
+    info(
+        f"Copying photos from {source_dialog.name} to {destination_dialog.name}..."
     )
 
     index_entries: list[IndexEntry] = []
@@ -439,11 +517,11 @@ async def run_copy(client: TelegramClient) -> None:
                 break
             except errors.FloodWaitError as exc:
                 wait_seconds = exc.seconds + 1
-                print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+                warning(f"Telegram rate limit: waiting {wait_seconds} seconds...")
                 await asyncio.sleep(wait_seconds)
             except Exception as exc:  # Keep a long copy moving after one failure.
                 failed_groups += 1
-                print(f"  Failed source message(s) {source_ids}: {exc}")
+                failure(f"Source message(s) {source_ids} failed: {exc}")
                 sent_messages = []
                 break
 
@@ -456,8 +534,8 @@ async def run_copy(client: TelegramClient) -> None:
             source_messages, sent_messages, strict=False
         ):
             copied_photo_ids[source_message.id] = destination_message.id
-        print(
-            f"  Copied batch {group_number}: {len(source_messages)} photo(s) "
+        success(
+            f"Batch {group_number}: copied {len(source_messages)} photo(s) "
             f"from source message(s) {source_ids}"
         )
 
@@ -475,29 +553,35 @@ async def run_copy(client: TelegramClient) -> None:
                 )
             )
 
-    print("\nCopying text replies to copied photos...")
+    info("Copying text replies to copied photos...")
     copied_replies, failed_replies = await copy_text_replies(
         client,
         source,
         destination,
         copied_photo_ids,
     )
+    info("Sending final sticker and styled index...")
     index_messages = await post_index(client, destination, index_entries)
-    print("\nFinished.")
-    print(f"  Photos copied: {copied_photos}")
-    print(f"  Photo posts/albums copied: {copied_posts}")
-    print(f"  Text replies copied: {copied_replies}")
-    print(f"  Index entries: {len(index_entries)}")
-    print(f"  Index messages posted: {index_messages}")
-    print(f"  Failed photo batches: {failed_groups}")
-    print(f"  Failed text replies: {failed_replies}")
+    print(Fore.GREEN + Style.BRIGHT + "\n========== COPY COMPLETE ==========")
+    success(f"Photos copied: {copied_photos}")
+    success(f"Photo posts/albums copied: {copied_posts}")
+    success(f"Text replies copied: {copied_replies}")
+    success(f"Index entries: {len(index_entries)}")
+    success(f"Index messages posted: {index_messages}")
+    if failed_groups:
+        failure(f"Failed photo batches: {failed_groups}")
+    if failed_replies:
+        failure(f"Failed text replies: {failed_replies}")
 
 
 async def main() -> None:
     """Sign in to Telegram and start the interactive copier."""
+    show_banner()
     api_id, api_hash, session = read_credentials()
+    info("Connecting to Telegram...")
     client = TelegramClient(session, api_id, api_hash)
     await client.start()
+    success("Telegram account connected.")
     try:
         await run_copy(client)
     finally:
@@ -508,6 +592,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        warning("Stopped by user.")
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(f"Error: {exc}") from exc

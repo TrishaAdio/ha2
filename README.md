@@ -5,12 +5,15 @@ A Telethon userbot that copies every photo from a selected source channel to a s
 ## Features
 
 - Interactive numbered source and destination channel selection
+- Colored Colorama terminal UI with an ASCII startup banner and status display
 - Copies photos from oldest to newest
 - Preserves Telegram photo albums/batches
 - Preserves the exact caption text, emoji, and Telegram formatting entities
 - Preserves spoiler state on each photo
 - Downloads media to temporary storage and removes it after each batch
 - Creates a final index using the first line of every non-empty caption
+- Removes ordinary caption emoji from generated index titles only
+- Appends ` | Demo` to every generated index title
 - Sends the supplied sticker immediately before the final index
 - Formats the index as a blockquote with the supplied custom emoji
 - Makes every index title bold, underlined, and linked to its copied post
@@ -21,7 +24,7 @@ A Telethon userbot that copies every photo from a selected source channel to a s
 
 ## Code size
 
-`main.py` uses **513 total lines**. Of those, **431 are non-empty, non-comment lines**, measured from the committed file.
+`main.py` uses **597 total lines**. Of those, **501 are non-empty, non-comment lines**, measured from the committed file.
 
 ## Requirements
 
@@ -67,13 +70,13 @@ On the first run, Telethon asks for your Telegram phone number, login code, and 
 Example index appearance:
 
 ```text
-🟢 real choclate
-🟢 real dustbin
-🟢 brush for sell
-🟢 nft selling
+🟢 real choclate | Demo
+🟢 real dustbin | Demo
+🟢 brush for sell | Demo
+🟢 nft selling | Demo
 ```
 
-The entire list is a blockquote. The green marker uses custom emoji ID `6298751564592973547`; each title is bold, underlined, and links directly to its copied destination post.
+The entire list is a blockquote. Ordinary emoji found in source caption titles are excluded from this index, while the original copied captions remain unchanged. The green marker uses custom emoji ID `6298751564592973547`; each title and its ` | Demo` suffix are bold, underlined, and link directly to the copied destination post.
 
 ## Security
 

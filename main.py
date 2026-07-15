@@ -19,6 +19,16 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.tl.custom import Dialog, Message
 
+INDEX_CUSTOM_EMOJI = "🟢"
+INDEX_CUSTOM_EMOJI_ID = 6298751564592973547
+INDEX_STICKER = types.InputDocument(
+    id=6016935932551241313,
+    access_hash=-7366320401303529044,
+    file_reference=bytes.fromhex(
+        "01004f3c996a58123cb397c2c4097adce4b99e40692afdf4f3"
+    ),
+)
+
 
 @dataclass(frozen=True)
 class IndexEntry:
@@ -228,6 +238,46 @@ async def copy_photo_group(
         return await send_photo_album(client, destination, paths, messages)
 
 
+async def copy_text_replies(
+    client: TelegramClient,
+    source: types.Channel,
+    destination: types.Channel,
+    copied_photo_ids: dict[int, int],
+) -> tuple[int, int]:
+    """Copy plain-text channel messages that directly reply to copied photos."""
+    copied = 0
+    failed = 0
+
+    async for message in client.iter_messages(source, reverse=True):
+        destination_photo_id = copied_photo_ids.get(message.reply_to_msg_id)
+        if destination_photo_id is None or not message.message:
+            continue
+        if message.photo or message.document or message.action:
+            continue
+
+        while True:
+            try:
+                await client.send_message(
+                    destination,
+                    message.message,
+                    formatting_entities=list(message.entities or []),
+                    reply_to=destination_photo_id,
+                    link_preview=bool(message.web_preview),
+                )
+                copied += 1
+                break
+            except errors.FloodWaitError as exc:
+                wait_seconds = exc.seconds + 1
+                print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+                await asyncio.sleep(wait_seconds)
+            except Exception as exc:  # Keep copying after one malformed reply.
+                failed += 1
+                print(f"  Failed text reply {message.id}: {exc}")
+                break
+
+    return copied, failed
+
+
 def caption_position(messages: Sequence[Message]) -> int | None:
     """Return the position of the first photo containing a non-empty caption."""
     for position, message in enumerate(messages):
@@ -258,33 +308,62 @@ def utf16_length(value: str) -> int:
 def make_index_messages(
     entries: Iterable[IndexEntry],
     max_units: int = 3900,
-    max_links: int = 80,
-) -> Iterable[tuple[str, list[types.MessageEntityTextUrl]]]:
-    """Build safe-size index messages with clickable first-caption lines."""
+    max_entries: int = 20,
+) -> Iterable[tuple[str, list[types.TypeMessageEntity]]]:
+    """Build blockquoted index messages with custom-emoji linked titles."""
     text = ""
-    entities: list[types.MessageEntityTextUrl] = []
+    line_entities: list[types.TypeMessageEntity] = []
+    entry_count = 0
+
+    def finish_chunk() -> tuple[str, list[types.TypeMessageEntity]]:
+        finished_text = text.rstrip("\n")
+        blockquote = types.MessageEntityBlockquote(
+            offset=0,
+            length=utf16_length(finished_text),
+        )
+        return finished_text, [blockquote, *line_entities]
 
     for entry in entries:
-        addition = f"{entry.title}\n"
-        if entities and (
-            utf16_length(text + addition) > max_units or len(entities) >= max_links
+        addition = f"{INDEX_CUSTOM_EMOJI} {entry.title}\n"
+        if entry_count and (
+            utf16_length(text + addition) > max_units
+            or entry_count >= max_entries
         ):
-            yield text.rstrip("\n"), entities
+            yield finish_chunk()
             text = ""
-            entities = []
+            line_entities = []
+            entry_count = 0
 
-        offset = utf16_length(text)
-        entities.append(
-            types.MessageEntityTextUrl(
-                offset=offset,
-                length=utf16_length(entry.title),
-                url=entry.url,
-            )
+        line_offset = utf16_length(text)
+        title_offset = line_offset + utf16_length(f"{INDEX_CUSTOM_EMOJI} ")
+        title_length = utf16_length(entry.title)
+        line_entities.extend(
+            [
+                types.MessageEntityCustomEmoji(
+                    offset=line_offset,
+                    length=utf16_length(INDEX_CUSTOM_EMOJI),
+                    document_id=INDEX_CUSTOM_EMOJI_ID,
+                ),
+                types.MessageEntityTextUrl(
+                    offset=title_offset,
+                    length=title_length,
+                    url=entry.url,
+                ),
+                types.MessageEntityBold(
+                    offset=title_offset,
+                    length=title_length,
+                ),
+                types.MessageEntityUnderline(
+                    offset=title_offset,
+                    length=title_length,
+                ),
+            ]
         )
         text += addition
+        entry_count += 1
 
-    if entities:
-        yield text.rstrip("\n"), entities
+    if entry_count:
+        yield finish_chunk()
 
 
 async def post_index(
@@ -292,7 +371,19 @@ async def post_index(
     destination: types.Channel,
     entries: Sequence[IndexEntry],
 ) -> int:
-    """Post all linked index chunks and return the number of messages sent."""
+    """Send the index sticker, then all styled linked-index chunks."""
+    if not entries:
+        return 0
+
+    while True:
+        try:
+            await client.send_file(destination, INDEX_STICKER)
+            break
+        except errors.FloodWaitError as exc:
+            wait_seconds = exc.seconds + 1
+            print(f"  Telegram rate limit: waiting {wait_seconds} seconds...")
+            await asyncio.sleep(wait_seconds)
+
     count = 0
     for text, entities in make_index_messages(entries):
         while True:
@@ -331,6 +422,7 @@ async def run_copy(client: TelegramClient) -> None:
     )
 
     index_entries: list[IndexEntry] = []
+    copied_photo_ids: dict[int, int] = {}
     copied_photos = 0
     copied_posts = 0
     failed_groups = 0
@@ -360,6 +452,10 @@ async def run_copy(client: TelegramClient) -> None:
 
         copied_photos += len(source_messages)
         copied_posts += 1
+        for source_message, destination_message in zip(
+            source_messages, sent_messages, strict=False
+        ):
+            copied_photo_ids[source_message.id] = destination_message.id
         print(
             f"  Copied batch {group_number}: {len(source_messages)} photo(s) "
             f"from source message(s) {source_ids}"
@@ -379,13 +475,22 @@ async def run_copy(client: TelegramClient) -> None:
                 )
             )
 
+    print("\nCopying text replies to copied photos...")
+    copied_replies, failed_replies = await copy_text_replies(
+        client,
+        source,
+        destination,
+        copied_photo_ids,
+    )
     index_messages = await post_index(client, destination, index_entries)
     print("\nFinished.")
     print(f"  Photos copied: {copied_photos}")
     print(f"  Photo posts/albums copied: {copied_posts}")
+    print(f"  Text replies copied: {copied_replies}")
     print(f"  Index entries: {len(index_entries)}")
     print(f"  Index messages posted: {index_messages}")
-    print(f"  Failed batches: {failed_groups}")
+    print(f"  Failed photo batches: {failed_groups}")
+    print(f"  Failed text replies: {failed_replies}")
 
 
 async def main() -> None:

@@ -357,8 +357,18 @@ async def request(client: TelegramClient, query: object, *, label: str) -> objec
 
 
 def channel_from_updates(updates: object) -> types.Channel:
-    """Pull the supergroup out of an Updates envelope."""
-    for chat in getattr(updates, "chats", None) or []:
+    """Pull the supergroup out of an Updates envelope.
+
+    Telegram wraps some responses (e.g. ImportChatInvite) in a
+    ChatInviteJoinResultOk which nests the real Updates inside a `.updates`
+    attribute. This helper checks both the top level and one level down.
+    """
+    chats = getattr(updates, "chats", None)
+    if not chats:
+        inner = getattr(updates, "updates", None)
+        if inner is not None:
+            chats = getattr(inner, "chats", None)
+    for chat in chats or []:
         if isinstance(chat, types.Channel):
             return chat
     raise RuntimeError("Telegram did not return the group in its response.")

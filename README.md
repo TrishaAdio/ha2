@@ -1,9 +1,10 @@
 # Telethon Chat Tools
 
-Two Telethon userbot scripts:
+Three Telethon userbot scripts:
 
 - **`main.py`** copies every photo from one chat to another and posts a linked index. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
+- **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
 
 # main.py: Chat Photo Copier
 
@@ -107,6 +108,8 @@ The entire list is a blockquote. Ordinary emoji found in source caption titles a
 - The forum topic pickers show the 100 most recent topics.
 - Only plain-text replies are copied. Replies carrying their own media are skipped.
 
+> The index described above is a `main.py` feature. `oho.py` copies content but does not post an index, so groups it creates start without one. Use [reindex.py](#reindexpy-add-the-index-to-finished-groups) to add it afterwards.
+
 # oho.py: Multi-Account Group Cloner
 
 Creates many groups across several accounts and clones an entire source chat into each one.
@@ -175,6 +178,54 @@ Titles become `Archive 1`, `Archive 2`, and so on; links become `t.me/archive1`,
 - Creating many groups or claiming many public links from one account can hit Telegram's own limits, such as `CHANNELS_ADMIN_PUBLIC_TOO_MUCH`. The failing group reports the error and the run continues.
 - A source with content protection enabled may refuse to hand over its media. The run warns up front and reports whatever it has to skip.
 - Fresh or spam-limited accounts may be unable to create groups or message the sharing admin at all.
+
+# reindex.py: Add the Index to Finished Groups
+
+`oho.py` copies posts but never posts an index, so groups it built have all the content and no index. `reindex.py` fixes that after the fact. It reads the posts already sitting in each group, builds the index from their captions, and posts it with links that point at those copies.
+
+## Preview first
+
+The default run posts nothing. It scans every matching group and prints what it would do, including the resolved link for each entry:
+
+```text
+  Demos 1 (t.me/XCRYPTO1)
+    5 media post(s), 4 index entr(y/ies), 1 message(s) to post
+    🟢 real choclate | Demo  ->  https://t.me/XCRYPTO1/10
+    🟢 real dustbin | Demo   ->  https://t.me/XCRYPTO1/12
+```
+
+Open one of those links to confirm it lands on the right post, then answer `y` to post. Answering anything else exits without touching the groups.
+
+## Links
+
+Links use the group's public link when it has one, so `https://t.me/XCRYPTO1/10` rather than the internal `https://t.me/c/<numeric id>/10` form that only resolves for members. Groups still private fall back to the `t.me/c/` form.
+
+For an album, the entry links to the item that actually carries the caption, not the first item.
+
+## Which groups
+
+Groups are selected by prefix, and only groups the signed-in account created are considered:
+
+- **Group title starts with** — matches `Demos 1`, `Demos 2`, and so on.
+- **Public link starts with** — matches `t.me/XCRYPTO1`, `t.me/XCRYPTO2`, and so on.
+
+Either match is enough. Anything else the account owns is left alone.
+
+## Re-running
+
+Re-running replaces the previous index rather than stacking another copy underneath. The old index sticker and index messages are detected (no media, wrapped in a blockquote, carrying the marker emoji and the title suffix), deleted, then the fresh index is posted. Old index messages are never mistaken for content.
+
+## What gets indexed
+
+Only posts carrying media with a non-empty caption. Plain text posts are not captions, so they are skipped, as are captions that reduce to nothing once emoji are removed. The title is the first caption line that still has text after emoji are stripped.
+
+## Usage
+
+```bash
+python reindex.py
+```
+
+Credentials and `OWNER_SESSIONS` are read from `.env`, the same values `oho.py` uses. The accounts must be the ones that own the groups, since the main account has already left them.
 
 # Security
 

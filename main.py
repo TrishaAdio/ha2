@@ -1041,53 +1041,8 @@ def offset_mapper(spans: Sequence[tuple[int, int, int]]) -> Callable[[int], int]
     return mapped
 
 
-def rewrite_link_url(url: str, old: str | None, new: str) -> str:
-    """Point a hyperlink at the new username when it targets a bare t.me link."""
-    rewrites = find_username_rewrites(url, old, new)
-    if not rewrites:
-        return url
-    pieces: list[str] = []
-    cursor = 0
-    for rewrite in rewrites:
-        pieces.append(url[cursor : rewrite.start])
-        pieces.append(rewrite.replacement)
-        cursor = rewrite.end
-    pieces.append(url[cursor:])
-    return "".join(pieces)
-
-
-def rewrite_message_text(
-    text: str,
-    entities: Sequence[types.TypeMessageEntity] | None,
-    old: str | None,
-    new: str,
-) -> tuple[str, list[types.TypeMessageEntity]] | None:
-    """Swap usernames in a message, keeping every other entity aligned.
-
-    Returns None when the message needs no change. Offsets are recomputed in
-    UTF-16 units because that is what Telegram entity offsets count, and any
-    emoji in the text makes them differ from Python indices.
-    """
-    rewrites = find_username_rewrites(text, old, new)
-    kept = [
-        entity for entity in entities or [] if not isinstance(entity, AUTO_ENTITIES)
-    ]
-
-    if not rewrites:
-        # The visible text is fine, but a hyperlink may still point at the old name.
-        relinked = [
-            _relinked_entity(entity, old, new)
-            for entity in kept
-        ]
-        if any(
-            isinstance(entity, types.MessageEntityTextUrl)
-            and entity.url != original.url
-            for entity, original in zip(relinked, kept, strict=True)
-            if isinstance(original, types.MessageEntityTextUrl)
-        ):
-            return text, relinked
-        return None
-
+def splice_text(text: str, rewrites: Sequence[Rewrite]) -> str:
+    """Apply replacement spans to a string from left to right."""
     pieces: list[str] = []
     cursor = 0
     for rewrite in rewrites:
@@ -1095,8 +1050,47 @@ def rewrite_message_text(
         pieces.append(rewrite.replacement)
         cursor = rewrite.end
     pieces.append(text[cursor:])
-    new_text = "".join(pieces)
+    return "".join(pieces)
 
+
+def _with_url(
+    entity: types.TypeMessageEntity, relink: Callable[[str], str]
+) -> types.TypeMessageEntity:
+    """Rewrite a hyperlink target, returning the original when unchanged."""
+    if not isinstance(entity, types.MessageEntityTextUrl):
+        return entity
+    updated = relink(entity.url)
+    if updated == entity.url:
+        return entity
+    changed = copy.copy(entity)
+    changed.url = updated
+    return changed
+
+
+def apply_text_rewrites(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    rewrites: Sequence[Rewrite],
+    relink: Callable[[str], str],
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Rewrite text spans and hyperlinks, keeping every entity aligned.
+
+    Returns None when nothing needs to change. Offsets are recomputed in
+    UTF-16 units because that is what Telegram entity offsets count, and any
+    emoji in the text makes them differ from Python indices.
+    """
+    kept = [
+        entity for entity in entities or [] if not isinstance(entity, AUTO_ENTITIES)
+    ]
+
+    if not rewrites:
+        # The visible text is fine, but a hyperlink may still be stale.
+        relinked = [_with_url(entity, relink) for entity in kept]
+        if any(new is not old for new, old in zip(relinked, kept, strict=True)):
+            return text, relinked
+        return None
+
+    new_text = splice_text(text, rewrites)
     spans = [
         (
             utf16_offset(text, rewrite.start),
@@ -1116,22 +1110,32 @@ def rewrite_message_text(
         shifted = copy.copy(entity)
         shifted.offset = start
         shifted.length = end - start
-        moved.append(_relinked_entity(shifted, old, new))
+        moved.append(_with_url(shifted, relink))
     return new_text, moved
 
 
-def _relinked_entity(
-    entity: types.TypeMessageEntity, old: str | None, new: str
-) -> types.TypeMessageEntity:
-    """Rewrite a hyperlink target, leaving every other entity untouched."""
-    if not isinstance(entity, types.MessageEntityTextUrl):
-        return entity
-    updated = rewrite_link_url(entity.url, old, new)
-    if updated == entity.url:
-        return entity
-    relinked = copy.copy(entity)
-    relinked.url = updated
-    return relinked
+def username_relinker(old: str | None, new: str) -> Callable[[str], str]:
+    """Build a hyperlink rewriter that swaps usernames inside t.me targets."""
+
+    def relink(url: str) -> str:
+        return splice_text(url, find_username_rewrites(url, old, new))
+
+    return relink
+
+
+def rewrite_message_text(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    old: str | None,
+    new: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Swap usernames in a message, keeping every other entity aligned."""
+    return apply_text_rewrites(
+        text,
+        entities,
+        find_username_rewrites(text, old, new),
+        username_relinker(old, new),
+    )
 
 
 async def set_status(event: object, text: str) -> None:
@@ -1214,6 +1218,129 @@ async def command_change(client: TelegramClient, event: object, args: list[str])
         summary += f", {stats.failed} failed"
     success(summary)
     await set_status(event, summary)
+
+
+# A link to a post in the very chat being cloned, public or private form,
+# optionally with a topic segment. The message id is always the last number.
+SELF_POST_RE = re.compile(
+    r"(?<![\w/])(?:https?://)?t\.me/"
+    r"(?:c/(?P<cid>\d+)|(?P<name>[A-Za-z][A-Za-z0-9_]{3,31}))"
+    r"/(?P<first>\d+)(?:/(?P<second>\d+))?",
+    re.IGNORECASE,
+)
+
+
+def find_self_post_links(
+    text: str,
+    username: str | None,
+    channel_id: int,
+    new_url_for: Callable[[int], str | None],
+) -> list[Rewrite]:
+    """Locate links pointing at posts of the chat being cloned."""
+    rewrites: list[Rewrite] = []
+    for match in SELF_POST_RE.finditer(text):
+        raw_channel = match.group("cid")
+        if raw_channel is not None:
+            if raw_channel != str(channel_id):
+                continue
+        else:
+            name = match.group("name")
+            if not username or not name or name.lower() != username.lower():
+                continue
+
+        message_id = int(match.group("second") or match.group("first"))
+        replacement = new_url_for(message_id)
+        if replacement is None:
+            continue  # That post was never cloned, so the old link stays.
+        if not match.group(0).lower().startswith("http"):
+            replacement = replacement.removeprefix("https://")
+        rewrites.append(Rewrite(match.start(), match.end(), replacement))
+    return rewrites
+
+
+@dataclass(frozen=True)
+class CloneLinks:
+    """Maps post links of the source chat onto their clones."""
+
+    username: str | None
+    channel_id: int
+    target: types.Channel
+    id_map: dict[int, int]
+
+    def new_url(self, message_id: int) -> str | None:
+        """Return the cloned post's link, or None when it was not cloned."""
+        cloned = self.id_map.get(message_id)
+        return None if cloned is None else message_link(self.target, cloned)
+
+    def rewrites(self, text: str) -> list[Rewrite]:
+        """Find self links in a piece of text that can be repointed."""
+        return find_self_post_links(text, self.username, self.channel_id, self.new_url)
+
+    def relink(self, url: str) -> str:
+        """Repoint a hyperlink target at the clone."""
+        return splice_text(url, self.rewrites(url))
+
+    def present_in(self, message: Message) -> bool:
+        """Return whether a post links to the source chat at all.
+
+        Detection ignores the id map, because during copying the later posts
+        have not been created yet.
+        """
+        def any_target(_message_id: int) -> str:
+            return "pending"
+
+        if message.message and find_self_post_links(
+            message.message, self.username, self.channel_id, any_target
+        ):
+            return True
+        return any(
+            isinstance(entity, types.MessageEntityTextUrl)
+            and find_self_post_links(
+                entity.url, self.username, self.channel_id, any_target
+            )
+            for entity in message.entities or []
+        )
+
+
+async def repoint_clone_links(
+    client: TelegramClient,
+    links: CloneLinks,
+    pending: Sequence[tuple[int, Message]],
+) -> tuple[int, int]:
+    """Edit cloned posts so their links point inside the clone.
+
+    This runs after copying finishes, because a post may link forward to one
+    that had not been cloned yet while the copy was still in progress.
+    """
+    repointed = 0
+    unresolved = 0
+    for new_id, source_message in pending:
+        text = source_message.message or ""
+        result = apply_text_rewrites(
+            text, source_message.entities, links.rewrites(text), links.relink
+        )
+        if result is None:
+            unresolved += 1
+            continue
+
+        new_text, new_entities = result
+        try:
+            await retry_on_wait(
+                client.edit_message,
+                links.target,
+                new_id,
+                new_text,
+                formatting_entities=new_entities,
+                link_preview=bool(source_message.web_preview),
+            )
+            repointed += 1
+        except errors.MessageNotModifiedError:
+            unresolved += 1
+        except Exception as exc:  # noqa: BLE001
+            unresolved += 1
+            failure(f"Could not repoint links in cloned post {new_id}: {exc}")
+        await asyncio.sleep(EDIT_DELAY)
+    return repointed, unresolved
 
 
 def channel_from_updates(updates: object) -> types.Channel:
@@ -1373,6 +1500,13 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         warning("Source has content protection enabled; some media may be refused.")
 
     id_map: dict[int, int] = {}
+    links = CloneLinks(
+        username=entity_username(source) if isinstance(source, types.Channel) else None,
+        channel_id=source.id,
+        target=target,
+        id_map=id_map,
+    )
+    pending_links: list[tuple[int, Message]] = []
     copied = skipped = failed = 0
     await set_status(event, f"Cloning into {title!r}...")
 
@@ -1410,10 +1544,19 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
             continue
         for source_message, new_message in zip(batch, sent, strict=False):
             id_map[source_message.id] = new_message.id
+            if links.present_in(source_message):
+                pending_links.append((new_message.id, source_message))
         copied += len(batch)
         if copied % STATUS_EVERY == 0:
             await set_status(event, f"Cloning into {title!r}... {copied} posts")
         await asyncio.sleep(CLONE_DELAY)
+
+    repointed = unresolved = 0
+    if pending_links:
+        info(f"Repointing links in {len(pending_links)} cloned post(s)...")
+        await set_status(event, f"Repointing links in {len(pending_links)} post(s)...")
+        repointed, unresolved = await repoint_clone_links(client, links, pending_links)
+        success(f"Repointed links in {repointed} post(s).")
 
     exported = await retry_on_wait(
         client,
@@ -1422,6 +1565,10 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     link = getattr(exported, "link", None) or "no link returned"
 
     report = f"Cloned {copied} post(s) into {title!r}\n{link}"
+    if repointed:
+        report += f"\nLinks repointed at the clone: {repointed}"
+    if unresolved:
+        report += f"\nLinks left pointing at the source: {unresolved}"
     if skipped:
         report += f"\nSkipped: {skipped}"
     if failed:

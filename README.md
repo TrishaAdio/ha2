@@ -89,13 +89,28 @@ Run it in a channel or group to copy the whole chat into a **fresh private chann
 
 - Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
 - Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.
+- **Links between posts are repointed at the clone.** A post linking to `t.me/srcchan/45` ends up linking to the cloned copy of post 45 instead of back at the source. This covers both plain links in the text and markdown-style hyperlinks, where only the target changes and the visible text is left exactly as it was.
 - Media is reused by file reference, so nothing is downloaded in the normal case. Expired references fall back to a download and re-upload.
 - Media Telegram cannot resend, such as stories, is skipped and counted.
 - The invite link is sent to your **Saved Messages** together with the copy counts, and also printed in the terminal.
 
+### How the link repointing works
+
+Repointing happens in a second pass, after all posts are copied. It has to: a post can link *forward* to a post further down the channel, which does not exist in the clone yet while copying is still in progress. Once every post has been created, the finished id map is used to rewrite the links.
+
+Recognised and repointed:
+
+- `t.me/srcchan/45` and `https://t.me/srcchan/45` for a public source, keeping the original scheme or lack of one.
+- `t.me/c/<source id>/45` for a private source.
+- Topic-style `t.me/srcchan/5/45`, where the message id is the last number.
+- Query suffixes such as `?single` are preserved.
+- Hyperlink targets, leaving the visible text untouched.
+
+Left alone: links to other channels, invite links, and links to posts that were never cloned. Those keep pointing at the source and are counted as unresolved in the report, which is better than producing a dead link.
+
 ## Code size
 
-`main.py` uses **1532 total lines**, of which **1291 are non-empty, non-comment lines**.
+`main.py` uses **1679 total lines**, of which **1412 are non-empty, non-comment lines**.
 
 ## Requirements
 

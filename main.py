@@ -9,8 +9,11 @@ linked index made from the first line of every non-empty caption.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import getpass
 import os
+import re
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -19,7 +22,7 @@ from typing import TypeVar, Union
 
 from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
-from telethon import TelegramClient, errors, functions, types, utils
+from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.tl.custom import Dialog, Message
 
 ChatEntity = Union[types.Channel, types.Chat]
@@ -49,6 +52,11 @@ WAIT_ERRORS = (
     errors.FloodWaitError,
     errors.FloodPremiumWaitError,
     errors.SlowModeWaitError,
+)
+STALE_MEDIA_ERRORS = (
+    errors.FileReferenceExpiredError,
+    errors.FileReferenceInvalidError,
+    errors.FileReferenceEmptyError,
 )
 WRITE_DENIED_ERRORS = (
     errors.ChatWriteForbiddenError,
@@ -913,8 +921,593 @@ async def run_copy(client: TelegramClient) -> None:
         failure(f"Failed text replies: {failed_replies}")
 
 
+# ---------------------------------------------------------------------------
+# live commands: .change and .clone
+# ---------------------------------------------------------------------------
+# Telegram re-detects these itself, so stale copies are dropped rather than
+# remapped. Everything else carries real styling and must survive the edit.
+AUTO_ENTITIES = (
+    types.MessageEntityMention,
+    types.MessageEntityUrl,
+    types.MessageEntityEmail,
+    types.MessageEntityHashtag,
+    types.MessageEntityBotCommand,
+    types.MessageEntityCashtag,
+    types.MessageEntityPhone,
+    types.MessageEntityBankCard,
+)
+# t.me paths that are not usernames and must never be rewritten.
+RESERVED_TME_PATHS = frozenset(
+    {
+        "addemoji", "addlist", "addstickers", "addtheme", "bg", "boost", "c",
+        "confirmphone", "contact", "giftcode", "invoice", "iv", "joinchat",
+        "login", "m", "proxy", "s", "setlanguage", "share", "socks",
+    }
+)
+MENTION_RE = re.compile(r"(?<![\w@/])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
+TME_RE = re.compile(
+    r"(?<![\w/])(?:https?://)?t\.me/([A-Za-z][A-Za-z0-9_]{3,31})/?(?![\w/])",
+    re.IGNORECASE,
+)
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+EDIT_DELAY = 0.4
+CLONE_DELAY = 0.6
+STATUS_EVERY = 20
+
+
+@dataclass(frozen=True)
+class Rewrite:
+    """One username occurrence to replace, measured in Python indices."""
+
+    start: int
+    end: int
+    replacement: str
+
+
+@dataclass
+class ChangeStats:
+    """Counters for a .change run."""
+
+    edited: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    locked: int = 0
+
+
+def utf16_offset(text: str, index: int) -> int:
+    """Convert a Python string index into a Telegram UTF-16 entity offset."""
+    return utf16_length(text[:index])
+
+
+def clean_username(raw: str) -> str | None:
+    """Normalize a supplied @username, returning None when it is unusable."""
+    candidate = raw.strip().lstrip("@")
+    if candidate.lower().startswith("t.me/"):
+        candidate = candidate[5:]
+    candidate = candidate.strip("/")
+    return candidate if USERNAME_RE.fullmatch(candidate) else None
+
+
+def find_username_rewrites(
+    text: str, old: str | None, new: str
+) -> list[Rewrite]:
+    """Locate every username occurrence that should become the new one.
+
+    Only the username characters are replaced, so a leading @, an http scheme
+    and a trailing slash all survive untouched.
+    """
+    rewrites: list[Rewrite] = []
+
+    for match in MENTION_RE.finditer(text):
+        name = match.group(1)
+        if old and name.lower() != old.lower():
+            continue
+        if name.lower() != new.lower():
+            rewrites.append(Rewrite(match.start(1), match.end(1), new))
+
+    for match in TME_RE.finditer(text):
+        name = match.group(1)
+        if name.lower() in RESERVED_TME_PATHS:
+            continue
+        if old and name.lower() != old.lower():
+            continue
+        if name.lower() != new.lower():
+            rewrites.append(Rewrite(match.start(1), match.end(1), new))
+
+    rewrites.sort(key=lambda item: item.start)
+    deduped: list[Rewrite] = []
+    for rewrite in rewrites:
+        if deduped and rewrite.start < deduped[-1].end:
+            continue  # Overlapping matches would corrupt the offsets.
+        deduped.append(rewrite)
+    return deduped
+
+
+def offset_mapper(spans: Sequence[tuple[int, int, int]]) -> Callable[[int], int]:
+    """Build a function moving old UTF-16 offsets onto the rewritten text."""
+
+    def mapped(offset: int) -> int:
+        delta = 0
+        for start, end, new_length in spans:
+            if offset >= end:
+                delta += new_length - (end - start)
+            elif offset > start:
+                # The offset sat inside replaced text; clamp to its new end.
+                return start + delta + new_length
+            else:
+                break
+        return offset + delta
+
+    return mapped
+
+
+def rewrite_link_url(url: str, old: str | None, new: str) -> str:
+    """Point a hyperlink at the new username when it targets a bare t.me link."""
+    rewrites = find_username_rewrites(url, old, new)
+    if not rewrites:
+        return url
+    pieces: list[str] = []
+    cursor = 0
+    for rewrite in rewrites:
+        pieces.append(url[cursor : rewrite.start])
+        pieces.append(rewrite.replacement)
+        cursor = rewrite.end
+    pieces.append(url[cursor:])
+    return "".join(pieces)
+
+
+def rewrite_message_text(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    old: str | None,
+    new: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Swap usernames in a message, keeping every other entity aligned.
+
+    Returns None when the message needs no change. Offsets are recomputed in
+    UTF-16 units because that is what Telegram entity offsets count, and any
+    emoji in the text makes them differ from Python indices.
+    """
+    rewrites = find_username_rewrites(text, old, new)
+    kept = [
+        entity for entity in entities or [] if not isinstance(entity, AUTO_ENTITIES)
+    ]
+
+    if not rewrites:
+        # The visible text is fine, but a hyperlink may still point at the old name.
+        relinked = [
+            _relinked_entity(entity, old, new)
+            for entity in kept
+        ]
+        if any(
+            isinstance(entity, types.MessageEntityTextUrl)
+            and entity.url != original.url
+            for entity, original in zip(relinked, kept, strict=True)
+            if isinstance(original, types.MessageEntityTextUrl)
+        ):
+            return text, relinked
+        return None
+
+    pieces: list[str] = []
+    cursor = 0
+    for rewrite in rewrites:
+        pieces.append(text[cursor : rewrite.start])
+        pieces.append(rewrite.replacement)
+        cursor = rewrite.end
+    pieces.append(text[cursor:])
+    new_text = "".join(pieces)
+
+    spans = [
+        (
+            utf16_offset(text, rewrite.start),
+            utf16_offset(text, rewrite.end),
+            utf16_length(rewrite.replacement),
+        )
+        for rewrite in rewrites
+    ]
+    mapped = offset_mapper(spans)
+
+    moved: list[types.TypeMessageEntity] = []
+    for entity in kept:
+        start = mapped(entity.offset)
+        end = mapped(entity.offset + entity.length)
+        if end <= start:
+            continue  # The styled text was replaced entirely.
+        shifted = copy.copy(entity)
+        shifted.offset = start
+        shifted.length = end - start
+        moved.append(_relinked_entity(shifted, old, new))
+    return new_text, moved
+
+
+def _relinked_entity(
+    entity: types.TypeMessageEntity, old: str | None, new: str
+) -> types.TypeMessageEntity:
+    """Rewrite a hyperlink target, leaving every other entity untouched."""
+    if not isinstance(entity, types.MessageEntityTextUrl):
+        return entity
+    updated = rewrite_link_url(entity.url, old, new)
+    if updated == entity.url:
+        return entity
+    relinked = copy.copy(entity)
+    relinked.url = updated
+    return relinked
+
+
+async def set_status(event: object, text: str) -> None:
+    """Replace the command message with a progress line, ignoring failures."""
+    with contextlib.suppress(Exception):  # Status must never break the command.
+        await event.edit(text)
+
+
+async def command_change(client: TelegramClient, event: object, args: list[str]) -> None:
+    """Rewrite usernames across every post in the current chat."""
+    if not args or len(args) > 2:
+        await set_status(
+            event,
+            "Usage: .change @newname   or   .change @oldname @newname",
+        )
+        return
+
+    if len(args) == 2:
+        old = clean_username(args[0])
+        new = clean_username(args[1])
+        if not old:
+            await set_status(event, f"{args[0]} is not a valid username.")
+            return
+    else:
+        old = None
+        new = clean_username(args[0])
+    if not new:
+        await set_status(event, f"{args[-1]} is not a valid username.")
+        return
+
+    scope = f"@{old}" if old else "every username"
+    info(f"Rewriting {scope} to @{new} in chat {event.chat_id}...")
+    await set_status(event, f"Rewriting {scope} to @{new}...")
+
+    stats = ChangeStats()
+    async for message in client.iter_messages(event.chat_id):
+        if message.action is not None or message.id == event.id:
+            continue
+        if not message.message:
+            continue
+
+        result = rewrite_message_text(message.message, message.entities, old, new)
+        if result is None:
+            stats.unchanged += 1
+            continue
+
+        new_text, new_entities = result
+        try:
+            await retry_on_wait(
+                client.edit_message,
+                event.chat_id,
+                message.id,
+                new_text,
+                formatting_entities=new_entities,
+                link_preview=bool(message.web_preview),
+            )
+            stats.edited += 1
+        except errors.MessageNotModifiedError:
+            stats.unchanged += 1
+        except (
+            errors.MessageAuthorRequiredError,
+            errors.MessageEditTimeExpiredError,
+            errors.ChatAdminRequiredError,
+        ):
+            stats.locked += 1
+        except Exception as exc:  # noqa: BLE001
+            stats.failed += 1
+            failure(f"Message {message.id} could not be edited: {exc}")
+
+        if stats.edited and stats.edited % STATUS_EVERY == 0:
+            await set_status(event, f"Rewriting to @{new}... {stats.edited} edited")
+        await asyncio.sleep(EDIT_DELAY)
+
+    summary = f"Rewrote {scope} to @{new}: {stats.edited} edited"
+    if stats.unchanged:
+        summary += f", {stats.unchanged} already fine"
+    if stats.locked:
+        summary += f", {stats.locked} not editable"
+    if stats.failed:
+        summary += f", {stats.failed} failed"
+    success(summary)
+    await set_status(event, summary)
+
+
+def channel_from_updates(updates: object) -> types.Channel:
+    """Pull a channel out of an Updates envelope, or its nested result."""
+    chats = getattr(updates, "chats", None)
+    if not chats:
+        inner = getattr(updates, "updates", None)
+        if inner is not None:
+            chats = getattr(inner, "chats", None)
+    for chat in chats or []:
+        if isinstance(chat, types.Channel):
+            return chat
+    raise RuntimeError("Telegram did not return the new channel.")
+
+
+def clone_input_media(message: Message) -> object | None:
+    """Reuse the existing file for a clone, or None when the post is text."""
+    media = message.media
+    if media is None or isinstance(media, types.MessageMediaWebPage):
+        return None
+    input_media = utils.get_input_media(media)
+    if isinstance(input_media, types.InputMediaEmpty):
+        raise TypeError(f"{type(media).__name__} cannot be resent")
+    if hasattr(input_media, "spoiler"):
+        input_media.spoiler = has_media_spoiler(message)
+    return input_media
+
+
+async def iter_clone_batches(
+    client: TelegramClient, source: ChatEntity
+) -> AsyncIterator[list[Message]]:
+    """Yield every source post oldest first, keeping albums together."""
+    album: list[Message] = []
+    album_id: int | None = None
+
+    async for message in client.iter_messages(source, reverse=True):
+        if message.action is not None:
+            continue
+        if not message.message and message.media is None:
+            continue
+
+        if message.grouped_id is None:
+            if album:
+                yield album
+                album, album_id = [], None
+            yield [message]
+            continue
+
+        if album and message.grouped_id != album_id:
+            yield album
+            album = []
+        album_id = message.grouped_id
+        album.append(message)
+
+    if album:
+        yield album
+
+
+async def send_clone_batch(
+    client: TelegramClient,
+    target: types.Channel,
+    batch: Sequence[Message],
+    medias: Sequence[object],
+    id_map: dict[int, int],
+) -> list[Message]:
+    """Publish one cloned post or album, keeping replies pointing correctly."""
+    first = batch[0]
+    reply_to = None
+    replied = replied_message_id(first)
+    if replied is not None and replied in id_map:
+        reply_to = types.InputReplyToMessage(reply_to_msg_id=id_map[replied])
+
+    if len(batch) > 1:
+        items = [
+            types.InputSingleMedia(
+                media=media,
+                message=message.message or "",
+                entities=list(message.entities or []),
+            )
+            for message, media in zip(batch, medias, strict=True)
+        ]
+        query = functions.messages.SendMultiMediaRequest(
+            peer=target, multi_media=items, reply_to=reply_to
+        )
+        result = await retry_on_wait(client, query)
+        produced = client._get_response_message(
+            [item.random_id for item in items], result, target
+        )
+        if not produced:
+            return []
+        return list(produced) if isinstance(produced, list) else [produced]
+
+    if medias[0] is None:
+        query = functions.messages.SendMessageRequest(
+            peer=target,
+            message=first.message,
+            entities=list(first.entities or []),
+            no_webpage=not first.web_preview,
+            reply_to=reply_to,
+        )
+    else:
+        query = functions.messages.SendMediaRequest(
+            peer=target,
+            media=medias[0],
+            message=first.message or "",
+            entities=list(first.entities or []),
+            reply_to=reply_to,
+        )
+    result = await retry_on_wait(client, query)
+    sent = client._get_response_message(query, result, target)
+    return [sent] if sent else []
+
+
+async def reuploaded_media(
+    client: TelegramClient, message: Message, directory: Path
+) -> object | None:
+    """Download and upload a post's media when its reference cannot be reused."""
+    if message.media is None or isinstance(message.media, types.MessageMediaWebPage):
+        return None
+    path = await retry_on_wait(
+        client.download_media, message, file=str(directory / str(message.id))
+    )
+    if not path:
+        raise RuntimeError(f"could not download media of message {message.id}")
+    handle = await retry_on_wait(client.upload_file, path)
+    if message.photo:
+        return types.InputMediaUploadedPhoto(
+            file=handle, spoiler=has_media_spoiler(message)
+        )
+    return types.InputMediaUploadedDocument(
+        file=handle,
+        mime_type=message.file.mime_type if message.file else "application/octet-stream",
+        attributes=list(getattr(message.document, "attributes", None) or []),
+        spoiler=has_media_spoiler(message),
+    )
+
+
+async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
+    """Clone the current chat into a fresh private channel."""
+    source = await event.get_chat()
+    if not is_supported_chat(source):
+        await set_status(event, "This chat cannot be cloned.")
+        return
+
+    title = " ".join(args).strip() or utils.get_display_name(source) or "Clone"
+    info(f"Cloning {utils.get_display_name(source)} into a private channel...")
+    await set_status(event, f"Creating private channel {title!r}...")
+
+    created = await retry_on_wait(
+        client,
+        functions.channels.CreateChannelRequest(title=title, about="", broadcast=True),
+    )
+    target = channel_from_updates(created)
+    success(f"Created private channel {title!r} (id {target.id}).")
+
+    if getattr(source, "noforwards", False):
+        warning("Source has content protection enabled; some media may be refused.")
+
+    id_map: dict[int, int] = {}
+    copied = skipped = failed = 0
+    await set_status(event, f"Cloning into {title!r}...")
+
+    async for batch in iter_clone_batches(client, source):
+        ids = ", ".join(str(message.id) for message in batch)
+        try:
+            medias = [clone_input_media(message) for message in batch]
+        except (TypeError, ValueError, AttributeError) as exc:
+            skipped += len(batch)
+            warning(f"Skipping {ids} ({exc}).")
+            continue
+
+        try:
+            sent = await send_clone_batch(client, target, batch, medias, id_map)
+        except STALE_MEDIA_ERRORS:
+            warning(f"File references for {ids} expired; re-uploading.")
+            try:
+                with tempfile.TemporaryDirectory(prefix="clone-") as temp_dir:
+                    fresh = [
+                        await reuploaded_media(client, message, Path(temp_dir))
+                        for message in batch
+                    ]
+                    sent = await send_clone_batch(client, target, batch, fresh, id_map)
+            except Exception as exc:  # noqa: BLE001
+                failed += len(batch)
+                failure(f"Gave up on {ids} ({exc}).")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            failed += len(batch)
+            failure(f"Could not clone {ids} ({exc}).")
+            continue
+
+        if not sent:
+            failed += len(batch)
+            continue
+        for source_message, new_message in zip(batch, sent, strict=False):
+            id_map[source_message.id] = new_message.id
+        copied += len(batch)
+        if copied % STATUS_EVERY == 0:
+            await set_status(event, f"Cloning into {title!r}... {copied} posts")
+        await asyncio.sleep(CLONE_DELAY)
+
+    exported = await retry_on_wait(
+        client,
+        functions.messages.ExportChatInviteRequest(peer=target, title="clone"),
+    )
+    link = getattr(exported, "link", None) or "no link returned"
+
+    report = f"Cloned {copied} post(s) into {title!r}\n{link}"
+    if skipped:
+        report += f"\nSkipped: {skipped}"
+    if failed:
+        report += f"\nFailed: {failed}"
+
+    saved = True
+    try:
+        await retry_on_wait(client.send_message, "me", report, link_preview=False)
+    except Exception as exc:  # noqa: BLE001
+        saved = False
+        failure(f"Could not save the invite link to Saved Messages: {exc}")
+
+    success(f"Clone finished: {copied} copied, {skipped} skipped, {failed} failed.")
+    success(f"Invite link: {link}")
+    await set_status(
+        event,
+        report + ("\nSaved to your Saved Messages." if saved else "\nNot saved; see log."),
+    )
+
+
+COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
+    "change": command_change,
+    "clone": command_clone,
+}
+COMMAND_HELP = (
+    "Commands\n"
+    ".change @newname          replace every username in every post\n"
+    ".change @oldname @newname replace only that username\n"
+    ".clone [title]            clone this chat into a private channel\n"
+    ".help                     show this list"
+)
+
+
+async def run_commands(client: TelegramClient) -> None:
+    """Listen for the dot commands until interrupted."""
+    busy = asyncio.Lock()
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(\w+)(?:\s+([\s\S]*))?$"))
+    async def dispatch(event: object) -> None:
+        name = (event.pattern_match.group(1) or "").lower()
+        raw_args = (event.pattern_match.group(2) or "").strip()
+        if name == "help":
+            await set_status(event, COMMAND_HELP)
+            return
+        handler = COMMANDS.get(name)
+        if handler is None:
+            return
+        if busy.locked():
+            await set_status(event, "Still working on the previous command.")
+            return
+        async with busy:
+            try:
+                await handler(client, event, raw_args.split() if raw_args else [])
+            except Exception as exc:  # noqa: BLE001
+                failure(f".{name} failed: {exc}")
+                await set_status(event, f".{name} failed: {exc}")
+
+    print(Fore.YELLOW + Style.BRIGHT + "\n== COMMAND MODE ==")
+    print(Fore.WHITE + COMMAND_HELP)
+    info("Send the commands from this account in any chat. Ctrl+C to stop.")
+    await client.run_until_disconnected()
+
+
+def choose_mode() -> str:
+    """Pick between the interactive copier and the live command listener."""
+    configured = (os.getenv("MAIN_MODE") or "").strip().lower()
+    if configured in {"copy", "commands"}:
+        return configured
+
+    print(Fore.YELLOW + Style.BRIGHT + "\n== MODE ==")
+    print(Fore.GREEN + Style.BRIGHT + "  [  1] " + Fore.WHITE + "Copy photos between two chats")
+    print(
+        Fore.GREEN + Style.BRIGHT + "  [  2] "
+        + Fore.WHITE + "Command mode (.change, .clone)"
+    )
+    while True:
+        choice = input(Fore.CYAN + "Select number > ").strip()
+        if choice == "1":
+            return "copy"
+        if choice == "2":
+            return "commands"
+        warning("Enter 1 or 2.")
+
+
 async def main() -> None:
-    """Sign in to Telegram and start the interactive copier."""
+    """Sign in to Telegram and start the chosen mode."""
     show_banner()
     api_id, api_hash, session = read_credentials()
     info("Connecting to Telegram...")
@@ -922,7 +1515,10 @@ async def main() -> None:
     await client.start()
     success("Telegram account connected.")
     try:
-        await run_copy(client)
+        if choose_mode() == "commands":
+            await run_commands(client)
+        else:
+            await run_copy(client)
     finally:
         await client.disconnect()
 

@@ -2,7 +2,7 @@
 
 Three Telethon userbot scripts:
 
-- **`main.py`** copies every photo from one chat to another and posts a linked index. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
+- **`main.py`** copies every photo from one chat to another and posts a linked index, and also runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
 
@@ -43,9 +43,59 @@ A Telethon userbot that copies every photo from a selected source chat to a sele
 - Legacy basic groups have no per-message permalinks, so index titles stay bold and underlined but are not clickable. The run reports this at the end.
 - Slow mode is handled: the script waits out each interval, and because Telegram rejects albums under slow mode, those batches are published one photo at a time.
 
+## Modes
+
+`main.py` starts by asking what to do:
+
+1. **Copy photos between two chats** — the interactive copier described above.
+2. **Command mode** — stays connected and listens for `.change` and `.clone`.
+
+Set `MAIN_MODE=copy` or `MAIN_MODE=commands` in `.env` to skip the question.
+
+# Commands (`main.py` command mode)
+
+In command mode the script listens for dot commands typed **from your own account** in any chat. Nobody else can trigger them. The command message itself is replaced with live progress, so chats stay clean.
+
+```text
+.change @newname            replace every username in every post
+.change @oldname @newname   replace only that username
+.clone [title]              clone this chat into a private channel
+.help                       show the list
+```
+
+## `.change`
+
+Run it in a channel to rewrite usernames across the whole history. With one argument every `@mention` becomes the new name; with two, only the named username is touched, which is the safer form.
+
+What it rewrites:
+
+- `@mentions` in message text and in media captions.
+- Bare `t.me/username` links, keeping any `https://` scheme and trailing slash.
+- Hyperlink targets that point at a bare `t.me/username`, even when the visible text needs no change.
+
+What it deliberately leaves alone:
+
+- Invite links (`t.me/+hash`, `t.me/joinchat/...`) and private post links (`t.me/c/...`).
+- Public **post** links like `t.me/oldchan/45`, because rewriting the name would repoint a specific post at a different channel.
+- Email addresses, and reserved `t.me` paths such as `addstickers` or `boost`.
+
+**Formatting is preserved.** Replacing a username changes the text length, which shifts every entity after it. Offsets are recomputed in UTF-16 units, which is what Telegram counts — with emoji in a message those differ from Python string indices, so getting this wrong silently moves bold and links onto the wrong words. Telegram re-detects mentions, URLs and hashtags itself, so stale copies of those are dropped rather than remapped; real styling (bold, italic, underline, strike, spoiler, code, hyperlinks, custom emoji, blockquote) is remapped and kept.
+
+Editing is rate limited, so the run paces itself and waits out flood limits. Posts it cannot edit are counted and reported rather than aborting the run: in channels an admin with edit rights can edit any post at any time, but in ordinary groups Telegram only allows editing your own messages for 48 hours.
+
+## `.clone`
+
+Run it in a channel or group to copy the whole chat into a **fresh private channel** owned by you. An optional title overrides the default, which reuses the source title.
+
+- Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
+- Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.
+- Media is reused by file reference, so nothing is downloaded in the normal case. Expired references fall back to a download and re-upload.
+- Media Telegram cannot resend, such as stories, is skipped and counted.
+- The invite link is sent to your **Saved Messages** together with the copy counts, and also printed in the terminal.
+
 ## Code size
 
-`main.py` uses **936 total lines**, of which **785 are non-empty, non-comment lines**.
+`main.py` uses **1532 total lines**, of which **1291 are non-empty, non-comment lines**.
 
 ## Requirements
 

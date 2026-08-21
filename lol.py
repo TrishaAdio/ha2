@@ -21,7 +21,7 @@ import getpass
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Union
 
@@ -138,22 +138,25 @@ def can_delete_others(entity: ChatEntity) -> bool:
     return bool(rights and rights.delete_messages)
 
 
-def chat_type_label(entity: ChatEntity) -> str:
+def chat_type_label(entity: object) -> str:
     """Describe a chat for the logs."""
+    if isinstance(entity, types.User):
+        return "private chat"
     if isinstance(entity, types.Chat):
         return "group"
-    if entity.gigagroup:
-        return "broadcast group"
-    if entity.broadcast:
-        return "channel"
-    if entity.megagroup:
-        return "supergroup"
-    return "channel"
+    if isinstance(entity, types.Channel):
+        if entity.gigagroup:
+            return "broadcast group"
+        if entity.broadcast:
+            return "channel"
+        if entity.megagroup:
+            return "supergroup"
+    return "chat"
 
 
-def chat_name(entity: ChatEntity) -> str:
+def chat_name(entity: object) -> str:
     """Return a readable chat name for reports."""
-    return utils.get_display_name(entity) or f"id {entity.id}"
+    return utils.get_display_name(entity) or f"id {getattr(entity, 'id', '?')}"
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,24 @@ async def matching_messages(
             yield message
 
 
+async def my_photo_messages(
+    client: TelegramClient, entity: object
+) -> AsyncIterator[Message]:
+    """Yield photo posts this account sent in a chat, captions included.
+
+    A photo and its caption are a single message, so deleting the message
+    removes both. `from_user='me'` and the photo filter run server-side, so
+    only this account's own photos come back.
+    """
+    async for message in client.iter_messages(
+        entity, from_user="me", filter=types.InputMessagesFilterPhotos
+    ):
+        if message.action is not None:
+            continue
+        if message.photo is not None:
+            yield message
+
+
 # ---------------------------------------------------------------------------
 # scanning and the pending plan
 # ---------------------------------------------------------------------------
@@ -203,9 +224,13 @@ class GroupHits:
 
 @dataclass
 class Plan:
-    """A scanned-but-not-yet-executed deletion, awaiting confirmation."""
+    """A scanned-but-not-yet-executed deletion, awaiting confirmation.
 
-    needle: str
+    `subject` is a plain noun phrase, e.g. "posts containing @HJGFDS" or
+    "photos from this account", used verbatim in every progress line.
+    """
+
+    subject: str
     hits: list[GroupHits]
     created: float = field(default_factory=time.monotonic)
 
@@ -230,16 +255,38 @@ async def deletable_dialogs(client: TelegramClient) -> list[Dialog]:
     return dialogs
 
 
-async def scan(client: TelegramClient, needle: str, event: object) -> Plan:
-    """Find every matching post across all moderated chats."""
-    dialogs = await deletable_dialogs(client)
-    LOG.info("Scanning %s moderated chat(s) for %r...", len(dialogs), needle)
+async def all_dialogs(client: TelegramClient) -> list[Dialog]:
+    """Return every chat the account is in, for deleting its own messages.
+
+    No admin right is needed to remove your own posts, so groups, channels
+    and private chats all qualify.
+    """
+    dialogs: list[Dialog] = []
+    async for dialog in client.iter_dialogs():
+        if isinstance(dialog.entity, (types.Channel, types.Chat, types.User)):
+            dialogs.append(dialog)
+    return dialogs
+
+
+Finder = Callable[[TelegramClient, object], AsyncIterator[Message]]
+
+
+async def scan(
+    client: TelegramClient,
+    dialogs: Sequence[Dialog],
+    finder: Finder,
+    subject: str,
+    progress: str,
+    event: object,
+) -> Plan:
+    """Collect matching message ids across the given chats using a finder."""
+    LOG.info("Scanning %s chat(s) for %s...", len(dialogs), subject)
 
     hits: list[GroupHits] = []
     for index, dialog in enumerate(dialogs, start=1):
         group_hits = GroupHits(entity=dialog.entity)
         try:
-            async for message in matching_messages(client, dialog.entity, needle):
+            async for message in finder(client, dialog.entity):
                 group_hits.message_ids.append(message.id)
         except errors.ChatAdminRequiredError:
             LOG.warning("%s: not allowed to read history; skipping.", group_hits.name)
@@ -257,9 +304,9 @@ async def scan(client: TelegramClient, needle: str, event: object) -> Plan:
                 len(group_hits.message_ids),
             )
         if index % SCAN_STATUS_EVERY == 0:
-            await set_status(event, f"Scanning for {needle}... {index}/{len(dialogs)}")
+            await set_status(event, f"{progress}... {index}/{len(dialogs)}")
 
-    return Plan(needle=needle, hits=hits)
+    return Plan(subject=subject, hits=hits)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +340,7 @@ async def execute(client: TelegramClient, plan: Plan, event: object) -> DeleteSt
             stats.failed += len(hit.message_ids)
             LOG.error("%s: delete failed (%s).", hit.name, exc)
         await set_status(
-            event, f"Deleting {plan.needle}... {index}/{len(plan.hits)} chat(s)"
+            event, f"Deleting {plan.subject}... {index}/{len(plan.hits)} chat(s)"
         )
         await asyncio.sleep(DELETE_DELAY)
     return stats
@@ -311,13 +358,13 @@ async def set_status(event: object, text: str) -> None:
 def preview_text(plan: Plan) -> str:
     """Render the scan result for the operator to confirm."""
     if not plan.hits:
-        return f"No posts contain {plan.needle}. Nothing to delete."
-    lines = [f"Found {plan.total} post(s) with {plan.needle} in {len(plan.hits)} chat(s):"]
+        return f"No {plan.subject} found. Nothing to delete."
+    lines = [f"Found {plan.total} {plan.subject} across {len(plan.hits)} chat(s):"]
     for hit in plan.hits[:15]:
         lines.append(f"  {hit.name}: {len(hit.message_ids)}")
     if len(plan.hits) > 15:
         remaining = sum(len(h.message_ids) for h in plan.hits[15:])
-        lines.append(f"  ... {len(plan.hits) - 15} more chat(s), {remaining} post(s)")
+        lines.append(f"  ... {len(plan.hits) - 15} more chat(s), {remaining} more")
     lines.append("Send .confirm within 5 minutes to delete, or .cancel.")
     return "\n".join(lines)
 
@@ -325,17 +372,25 @@ def preview_text(plan: Plan) -> str:
 COMMAND_HELP = (
     "Commands\n"
     ".delete <text>   find every post with that text in chats you moderate\n"
-    ".confirm         delete the posts found by the last .delete\n"
-    ".cancel          forget the last .delete\n"
+    ".delme           find every photo you sent, with its caption, everywhere\n"
+    ".confirm         delete what the last .delete or .delme found\n"
+    ".cancel          forget the last scan\n"
     ".help            show this list"
 )
 
 
 @dataclass
 class CommandState:
-    """Holds the single pending plan between .delete and .confirm."""
+    """Holds the single pending plan between a scan and .confirm."""
 
     pending: Plan | None = None
+
+
+async def store_scan(state: CommandState, event: object, plan: Plan) -> None:
+    """Keep a plan for confirmation and show its preview."""
+    state.pending = plan if plan.hits else None
+    LOG.info("Scan found %s item(s) in %s chat(s).", plan.total, len(plan.hits))
+    await set_status(event, preview_text(plan))
 
 
 async def handle_delete(
@@ -350,10 +405,32 @@ async def handle_delete(
         return
 
     await set_status(event, f"Scanning for {needle}...")
-    plan = await scan(client, needle, event)
-    state.pending = plan if plan.hits else None
-    LOG.info("Scan for %r found %s post(s) in %s chat(s).", needle, plan.total, len(plan.hits))
-    await set_status(event, preview_text(plan))
+    dialogs = await deletable_dialogs(client)
+
+    def finder(c: TelegramClient, entity: object) -> AsyncIterator[Message]:
+        return matching_messages(c, entity, needle)
+
+    plan = await scan(
+        client, dialogs, finder, f"posts containing {needle}", f"Scanning for {needle}", event
+    )
+    await store_scan(state, event, plan)
+
+
+async def handle_delme(
+    client: TelegramClient, event: object, state: CommandState
+) -> None:
+    """Scan for photos this account sent and store the plan."""
+    await set_status(event, "Scanning your photos...")
+    dialogs = await all_dialogs(client)
+    plan = await scan(
+        client,
+        dialogs,
+        my_photo_messages,
+        "photos from this account",
+        "Scanning your photos",
+        event,
+    )
+    await store_scan(state, event, plan)
 
 
 async def handle_confirm(
@@ -362,19 +439,19 @@ async def handle_confirm(
     """Execute the stored plan if one is waiting and still fresh."""
     plan = state.pending
     if plan is None:
-        await set_status(event, "Nothing to confirm. Run .delete <text> first.")
+        await set_status(event, "Nothing to confirm. Run .delete or .delme first.")
         return
     if plan.expired:
         state.pending = None
-        await set_status(event, "That .delete expired. Run it again.")
+        await set_status(event, "That scan expired. Run it again.")
         return
 
     state.pending = None
-    LOG.info("Confirmed: deleting %s post(s) for %r.", plan.total, plan.needle)
-    await set_status(event, f"Deleting {plan.total} post(s) with {plan.needle}...")
+    LOG.info("Confirmed: deleting %s item(s) (%s).", plan.total, plan.subject)
+    await set_status(event, f"Deleting {plan.total} {plan.subject}...")
     stats = await execute(client, plan, event)
 
-    summary = f"Deleted {stats.deleted} post(s) with {plan.needle} from {stats.groups} chat(s)"
+    summary = f"Deleted {stats.deleted} {plan.subject} across {stats.groups} chat(s)"
     if stats.failed:
         summary += f", {stats.failed} could not be deleted"
     LOG.info("%s", summary)
@@ -397,7 +474,7 @@ async def run_commands(client: TelegramClient) -> None:
             state.pending = None
             await set_status(event, "Cleared the pending delete.")
             return
-        if name not in {"delete", "confirm"}:
+        if name not in {"delete", "delme", "confirm"}:
             return
         if busy.locked():
             await set_status(event, "Still working on the previous command.")
@@ -406,6 +483,8 @@ async def run_commands(client: TelegramClient) -> None:
             try:
                 if name == "delete":
                     await handle_delete(client, event, args, state)
+                elif name == "delme":
+                    await handle_delme(client, event, state)
                 else:
                     await handle_confirm(client, event, state)
             except Exception as exc:  # noqa: BLE001

@@ -329,6 +329,10 @@ Send `.delme` and it finds **every photo this account has sent**, along with its
 
 Both commands delete with revoke, so posts are removed for everyone, not just hidden from you.
 
+## Chats that reject a filtered search
+
+Some chats reject the server-side search that carries a sender or media filter (`INPUT_FILTER_INVALID`). When that happens the scan retries the same chat with a simpler query, down to a plain history scan filtered on the client, so those chats are still swept rather than skipped. The whole pass is buffered per attempt, so a query that fails part way through never leaves a partial result behind.
+
 ## Usage
 
 ```bash

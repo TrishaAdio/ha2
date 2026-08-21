@@ -5,7 +5,7 @@ Four Telethon userbot scripts:
 - **`main.py`** copies every photo from one chat to another and posts a linked index, and also runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
-- **`lol.py`** deletes every post containing a given text across every group and channel you moderate. See [lol.py](#lolpy-delete-posts-by-text).
+- **`lol.py`** deletes posts across your chats: `.delete <text>` removes every post containing a text in groups you moderate, and `.delme` removes every photo you sent, with its caption, everywhere. See [lol.py](#lolpy-delete-posts-by-text).
 
 # main.py: Chat Photo Copier
 
@@ -299,12 +299,15 @@ Deletes every post containing a given text across **every group and channel wher
 
 ```text
 .delete <text>   find every post with that text in chats you moderate
-.confirm         delete the posts found by the last .delete
-.cancel          forget the last .delete
+.delme           find every photo you sent, with its caption, everywhere
+.confirm         delete what the last .delete or .delme found
+.cancel          forget the last scan
 .help            show the commands
 ```
 
-## How it works
+Both `.delete` and `.delme` only find and preview; nothing is removed until you send `.confirm`. The pending result expires after five minutes, so a stale `.confirm` cannot fire an old scan by accident.
+
+## `.delete <text>`
 
 Send `.delete @HJGFDS` and it:
 
@@ -312,11 +315,19 @@ Send `.delete @HJGFDS` and it:
 2. Searches each one for posts whose text or caption contains `@HJGFDS`. Posts **with media and without** are both matched, because a caption lives in the same place as plain message text.
 3. Reports how many posts it found in how many chats, and **deletes nothing yet**.
 
-Then you send `.confirm` to delete them for everyone, or `.cancel` to drop it. The pending result expires after five minutes, so a stale `.confirm` cannot fire an old sweep by accident.
+Matching is a case-insensitive substring, confirmed locally, so `@HJGFDS` and `@hjgfds` both hit. Telegram's own search narrows each chat's history first, then every candidate is re-checked locally so only real matches are deleted.
 
-## Matching
+## `.delme`
 
-Matching is a case-insensitive substring, confirmed locally, so `@HJGFDS` and `@hjgfds` both hit. Telegram's own search narrows each chat's history first, then every candidate is re-checked locally so only real matches are deleted. Deletion uses revoke, so posts are removed for everyone, not just hidden from you.
+Send `.delme` and it finds **every photo this account has sent**, along with its caption, across every chat you are in — groups, channels and private chats alike. A photo and its caption are one message, so deleting it removes both.
+
+- It matches only your own photos. Other people's photos, your text posts and your file/document uploads are left alone.
+- No admin right is needed, because you are deleting your own messages. That includes private chats, where the photo is removed for both sides.
+- Like `.delete`, it previews first and deletes nothing until `.confirm`.
+
+## Deletion
+
+Both commands delete with revoke, so posts are removed for everyone, not just hidden from you.
 
 ## Usage
 
@@ -328,7 +339,7 @@ Credentials come from `.env` (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_
 
 ## Caution
 
-`.confirm` deletes for everyone and cannot be undone. The `.delete` preview names the count and the chats first for exactly this reason — read it before confirming. A short search (one character) is refused so an over-broad sweep is harder to trigger by mistake.
+`.confirm` deletes for everyone and cannot be undone. The preview names the count and the chats first for exactly this reason — read it before confirming. `.delme` in particular sweeps every chat you are in, so check the preview before you confirm it. A short `.delete` search (one character) is refused so an over-broad sweep is harder to trigger by mistake.
 
 # Security
 

@@ -329,9 +329,13 @@ Send `.delme` and it finds **every photo this account has sent**, along with its
 
 Both commands delete with revoke, so posts are removed for everyone, not just hidden from you.
 
+## Speed
+
+Chats are scanned several at a time, since each scan is mostly waiting on Telegram. `SCAN_CONCURRENCY` in `.env` sets how many run at once (default 8). Raise it to sweep a large account faster, lower it if you hit flood limits.
+
 ## Chats that reject a filtered search
 
-Some chats reject the server-side search that carries a sender or media filter (`INPUT_FILTER_INVALID`). When that happens the scan retries the same chat with a simpler query, down to a plain history scan filtered on the client, so those chats are still swept rather than skipped. The whole pass is buffered per attempt, so a query that fails part way through never leaves a partial result behind.
+Some chats reject the server-side search that carries a media filter (`INPUT_FILTER_INVALID`). When that happens the scan retries that chat with a plain history scan filtered on the client, so it is still swept rather than skipped. The whole pass is buffered per attempt, so a query that fails part way through never leaves a partial result behind. `.delme` filters photos server-side and checks the sender on the client, which avoids the sender-plus-filter combination that triggers this in the first place.
 
 ## Usage
 

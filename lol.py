@@ -39,8 +39,20 @@ LOG = logging.getLogger("lol")
 LOG_FILE = "lol.log"
 
 DELETE_DELAY = 0.5
-SCAN_STATUS_EVERY = 25
 PENDING_TTL = 300.0
+
+
+def _positive_env(name: str, default: int) -> int:
+    """Read a positive integer environment value, or the default."""
+    raw = (os.getenv(name) or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return default
+
+
+# How many chats to scan at once. Scanning is dominated by round-trip latency,
+# so reading several chats concurrently is far faster than one after another.
+SCAN_CONCURRENCY = _positive_env("SCAN_CONCURRENCY", 8)
 MIN_QUERY_LENGTH = 2
 
 ASCII_BANNER = r"""
@@ -242,15 +254,16 @@ async def my_photo_messages(
     """Yield photo posts this account sent in a chat, captions included.
 
     A photo and its caption are a single message, so deleting the message
-    removes both. The fast path filters by sender and media type server-side;
-    chats that reject that combination fall back to a photo-only filter and
-    then to a plain scan, with the sender checked on the client.
+    removes both. The photo filter runs server-side so only photos come back,
+    the sender is checked on the client, and a chat that rejects the filter
+    falls back to a plain scan.
     """
     def keep(message: Message) -> bool:
         return message.photo is not None and sent_by_me(message, my_id)
 
+    # The photo filter alone is fast and widely supported; combining it with a
+    # sender is what some chats reject, and the sender is checked locally anyway.
     attempts = [
-        {"from_user": "me", "filter": types.InputMessagesFilterPhotos},
         {"filter": types.InputMessagesFilterPhotos},
         {},
     ]
@@ -331,33 +344,48 @@ async def scan(
     progress: str,
     event: object,
 ) -> Plan:
-    """Collect matching message ids across the given chats using a finder."""
-    LOG.info("Scanning %s chat(s) for %s...", len(dialogs), subject)
+    """Collect matching message ids across the given chats, several at a time.
 
-    hits: list[GroupHits] = []
-    for index, dialog in enumerate(dialogs, start=1):
+    Chats are read concurrently up to SCAN_CONCURRENCY, because each scan is
+    mostly waiting on Telegram; doing them in parallel is what keeps a sweep
+    over many chats from crawling. Results keep the original chat order.
+    """
+    total = len(dialogs)
+    LOG.info("Scanning %s chat(s) for %s (%s at a time)...", total, subject, SCAN_CONCURRENCY)
+
+    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+    progress_state = {"done": 0}
+
+    async def scan_one(dialog: Dialog) -> GroupHits | None:
         group_hits = GroupHits(entity=dialog.entity)
-        try:
-            async for message in finder(client, dialog.entity):
-                group_hits.message_ids.append(message.id)
-        except errors.ChatAdminRequiredError:
-            LOG.warning("%s: not allowed to read history; skipping.", group_hits.name)
-            continue
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("%s: could not scan (%s); skipping.", group_hits.name, exc)
-            continue
+        async with semaphore:
+            try:
+                async for message in finder(client, dialog.entity):
+                    group_hits.message_ids.append(message.id)
+            except errors.ChatAdminRequiredError:
+                LOG.warning("%s: not allowed to read history; skipping.", group_hits.name)
+                group_hits = None
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("%s: could not scan (%s); skipping.", group_hits.name, exc)
+                group_hits = None
 
-        if group_hits.message_ids:
-            hits.append(group_hits)
+        progress_state["done"] += 1
+        done = progress_state["done"]
+        if done % SCAN_CONCURRENCY == 0 or done == total:
+            await set_status(event, f"{progress}... {done}/{total}")
+
+        if group_hits and group_hits.message_ids:
             LOG.info(
                 "%s [%s]: %s match(es).",
                 group_hits.name,
                 chat_type_label(dialog.entity),
                 len(group_hits.message_ids),
             )
-        if index % SCAN_STATUS_EVERY == 0:
-            await set_status(event, f"{progress}... {index}/{len(dialogs)}")
+            return group_hits
+        return None
 
+    results = await asyncio.gather(*(scan_one(dialog) for dialog in dialogs))
+    hits = [group_hits for group_hits in results if group_hits is not None]
     return Plan(subject=subject, hits=hits)
 
 

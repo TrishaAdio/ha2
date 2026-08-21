@@ -172,38 +172,90 @@ def post_contains(message: Message, needle: str) -> bool:
     return needle.casefold() in text.casefold()
 
 
+async def _collect(
+    client: TelegramClient,
+    entity: object,
+    query_kwargs: dict,
+    keep: Callable[[Message], bool],
+) -> list[Message]:
+    """Read a chat with one set of query options, keeping matching posts.
+
+    The whole pass is buffered, so if Telegram rejects the query part way
+    through the caller can fall back to a simpler query without having acted
+    on a partial result.
+    """
+    found: list[Message] = []
+    async for message in client.iter_messages(entity, **query_kwargs):
+        if message.action is None and keep(message):
+            found.append(message)
+    return found
+
+
+async def _collect_with_fallback(
+    client: TelegramClient,
+    entity: object,
+    attempts: Sequence[dict],
+    keep: Callable[[Message], bool],
+) -> list[Message]:
+    """Try each query in turn, dropping server-side options Telegram rejects.
+
+    Some chats reject a SearchRequest that carries a sender or media filter
+    with INPUT_FILTER_INVALID. When that happens the next, simpler query is
+    tried, down to a plain history scan filtered entirely on the client.
+    """
+    last_error: errors.InputFilterInvalidError | None = None
+    for query_kwargs in attempts:
+        try:
+            return await _collect(client, entity, query_kwargs, keep)
+        except errors.InputFilterInvalidError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return []
+
+
 async def matching_messages(
-    client: TelegramClient, entity: ChatEntity, needle: str
+    client: TelegramClient, entity: object, needle: str
 ) -> AsyncIterator[Message]:
     """Yield posts whose text or caption contains the needle.
 
-    Telegram's own search narrows the history server-side, then each candidate
-    is confirmed locally so the match is an exact case-insensitive substring
-    rather than whatever the search tokenizer considered close.
+    Telegram's search narrows the history server-side; if the chat rejects the
+    search a full history scan is used instead. Either way each candidate is
+    confirmed locally as an exact case-insensitive substring.
     """
-    async for message in client.iter_messages(entity, search=needle):
-        if message.action is not None:
-            continue
-        if post_contains(message, needle):
-            yield message
+    def keep(message: Message) -> bool:
+        return post_contains(message, needle)
+
+    attempts = [{"search": needle}, {}]
+    for message in await _collect_with_fallback(client, entity, attempts, keep):
+        yield message
+
+
+def sent_by_me(message: Message, my_id: int) -> bool:
+    """Return whether this account sent the message."""
+    return bool(message.out) or message.sender_id == my_id
 
 
 async def my_photo_messages(
-    client: TelegramClient, entity: object
+    client: TelegramClient, entity: object, my_id: int
 ) -> AsyncIterator[Message]:
     """Yield photo posts this account sent in a chat, captions included.
 
     A photo and its caption are a single message, so deleting the message
-    removes both. `from_user='me'` and the photo filter run server-side, so
-    only this account's own photos come back.
+    removes both. The fast path filters by sender and media type server-side;
+    chats that reject that combination fall back to a photo-only filter and
+    then to a plain scan, with the sender checked on the client.
     """
-    async for message in client.iter_messages(
-        entity, from_user="me", filter=types.InputMessagesFilterPhotos
-    ):
-        if message.action is not None:
-            continue
-        if message.photo is not None:
-            yield message
+    def keep(message: Message) -> bool:
+        return message.photo is not None and sent_by_me(message, my_id)
+
+    attempts = [
+        {"from_user": "me", "filter": types.InputMessagesFilterPhotos},
+        {"filter": types.InputMessagesFilterPhotos},
+        {},
+    ]
+    for message in await _collect_with_fallback(client, entity, attempts, keep):
+        yield message
 
 
 # ---------------------------------------------------------------------------
@@ -421,11 +473,17 @@ async def handle_delme(
 ) -> None:
     """Scan for photos this account sent and store the plan."""
     await set_status(event, "Scanning your photos...")
+    me = await client.get_me()
+    my_id = me.id if me else 0
     dialogs = await all_dialogs(client)
+
+    def finder(c: TelegramClient, entity: object) -> AsyncIterator[Message]:
+        return my_photo_messages(c, entity, my_id)
+
     plan = await scan(
         client,
         dialogs,
-        my_photo_messages,
+        finder,
         "photos from this account",
         "Scanning your photos",
         event,

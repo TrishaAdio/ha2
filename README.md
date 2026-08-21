@@ -1,10 +1,11 @@
 # Telethon Chat Tools
 
-Three Telethon userbot scripts:
+Four Telethon userbot scripts:
 
 - **`main.py`** copies every photo from one chat to another and posts a linked index, and also runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
+- **`lol.py`** deletes every post containing a given text across every group and channel you moderate. See [lol.py](#lolpy-delete-posts-by-text).
 
 # main.py: Chat Photo Copier
 
@@ -291,6 +292,43 @@ python reindex.py
 ```
 
 Credentials and `OWNER_SESSIONS` are read from `.env`, the same values `oho.py` uses. The accounts must be the ones that own the groups, since the main account has already left them.
+
+# lol.py: Delete Posts by Text
+
+Deletes every post containing a given text across **every group and channel where you can delete other people's messages**. It runs as a live listener and takes dot commands typed from your own account in any chat.
+
+```text
+.delete <text>   find every post with that text in chats you moderate
+.confirm         delete the posts found by the last .delete
+.cancel          forget the last .delete
+.help            show the commands
+```
+
+## How it works
+
+Send `.delete @HJGFDS` and it:
+
+1. Lists every chat you are in where you can delete anyone's messages — that means chats you own or where you hold the delete-messages admin right. Chats where you are only a member are skipped, since a member can only delete their own messages.
+2. Searches each one for posts whose text or caption contains `@HJGFDS`. Posts **with media and without** are both matched, because a caption lives in the same place as plain message text.
+3. Reports how many posts it found in how many chats, and **deletes nothing yet**.
+
+Then you send `.confirm` to delete them for everyone, or `.cancel` to drop it. The pending result expires after five minutes, so a stale `.confirm` cannot fire an old sweep by accident.
+
+## Matching
+
+Matching is a case-insensitive substring, confirmed locally, so `@HJGFDS` and `@hjgfds` both hit. Telegram's own search narrows each chat's history first, then every candidate is re-checked locally so only real matches are deleted. Deletion uses revoke, so posts are removed for everyone, not just hidden from you.
+
+## Usage
+
+```bash
+python lol.py
+```
+
+Credentials come from `.env` (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`), the same values the other scripts use.
+
+## Caution
+
+`.confirm` deletes for everyone and cannot be undone. The `.delete` preview names the count and the chats first for exactly this reason — read it before confirming. A short search (one character) is refused so an over-broad sweep is harder to trigger by mistake.
 
 # Security
 

@@ -86,7 +86,31 @@ Editing is rate limited, so the run paces itself and waits out flood limits. Pos
 
 ## `.clone`
 
-Run it in a channel or group to copy the whole chat into a **fresh private channel** owned by you. An optional title overrides the default, which reuses the source title.
+Copies a whole chat into a **fresh private channel** owned by you.
+
+```text
+.clone                        clone the chat you are in
+.clone My Backup              clone this chat under a different title
+.clone https://t.me/+AbCdEf   clone that chat, from anywhere
+.clone @somechannel Archive   clone by handle, with a title
+```
+
+With no link it clones the current chat. A first argument that names a chat clones **that** chat instead, so you can run it from any chat — a saved-messages note to yourself, for instance. Anything after the link becomes the title; with no title the source name is reused.
+
+Accepted references: private invite links (`t.me/+hash` and the older `t.me/joinchat/hash`), public links (`t.me/name`), `@handles`, and private post links (`t.me/c/<id>`). A plain word is treated as a title, not a chat, so `.clone My Backup` still works as before.
+
+### Joining
+
+Invite links are inspected before any join attempt:
+
+- **Already a member** — used as it stands, no join, and it still clones. Joining twice would otherwise fail with `USER_ALREADY_PARTICIPANT`.
+- **Not a member** — joined first, since the history has to be readable. The account stays in the chat afterwards.
+- **Peek link** — some invites grant temporary read access; those clone without joining at all.
+- **Approval required** — reported instead of silently producing an empty clone, because a pending join request cannot read history.
+
+Public handles and links need no join, since public history is readable without membership.
+
+Expired and invalid invites are reported and nothing is created.
 
 - Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
 - Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.

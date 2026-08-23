@@ -1343,6 +1343,97 @@ async def repoint_clone_links(
     return repointed, unresolved
 
 
+# A private invite link, either the modern +hash form or the old joinchat one.
+INVITE_RE = re.compile(
+    r"^(?:https?://)?t\.me/(?:joinchat/|\+)(?P<hash>[\w-]+)/?$", re.IGNORECASE
+)
+# A public link or @handle naming a chat.
+PUBLIC_RE = re.compile(
+    r"^(?:(?:https?://)?t\.me/|@)(?P<name>[A-Za-z][A-Za-z0-9_]{3,31})/?$", re.IGNORECASE
+)
+# A private post link, which identifies the chat by its internal id.
+PRIVATE_ID_RE = re.compile(
+    r"^(?:https?://)?t\.me/c/(?P<id>\d+)(?:/\d+)*/?$", re.IGNORECASE
+)
+
+
+def looks_like_chat_reference(token: str) -> bool:
+    """Return whether a token names a chat rather than being title text."""
+    return bool(
+        INVITE_RE.match(token) or PUBLIC_RE.match(token) or PRIVATE_ID_RE.match(token)
+    )
+
+
+async def resolve_clone_source(client: TelegramClient, token: str) -> ChatEntity:
+    """Resolve a link, invite or @handle into a chat that can be cloned.
+
+    An invite link is inspected before joining, so a chat the account is
+    already in is used as it stands instead of failing on a second join.
+    """
+    invite = INVITE_RE.match(token)
+    if invite:
+        return await resolve_invite(client, invite.group("hash"))
+
+    private_id = PRIVATE_ID_RE.match(token)
+    if private_id:
+        return await retry_on_wait(
+            client.get_entity, types.PeerChannel(int(private_id.group("id")))
+        )
+
+    public = PUBLIC_RE.match(token)
+    if public:
+        return await retry_on_wait(client.get_entity, public.group("name"))
+
+    raise RuntimeError(f"{token} is not a chat link, invite or @handle")
+
+
+async def resolve_invite(client: TelegramClient, invite_hash: str) -> ChatEntity:
+    """Turn an invite hash into a chat, joining only when necessary."""
+    try:
+        checked = await retry_on_wait(
+            client, functions.messages.CheckChatInviteRequest(hash=invite_hash)
+        )
+    except (errors.InviteHashInvalidError, errors.InviteHashEmptyError) as exc:
+        raise RuntimeError("that invite link is not valid") from exc
+    except errors.InviteHashExpiredError as exc:
+        raise RuntimeError("that invite link has expired") from exc
+
+    # Already a member, or holding a temporary peek: use the chat directly.
+    existing = getattr(checked, "chat", None)
+    if existing is not None:
+        info(f"Already have access to {utils.get_display_name(existing)}.")
+        return existing
+
+    if getattr(checked, "request_needed", False):
+        raise RuntimeError(
+            "that invite needs admin approval, so its history cannot be read yet"
+        )
+
+    try:
+        joined = await retry_on_wait(
+            client, functions.messages.ImportChatInviteRequest(hash=invite_hash)
+        )
+    except errors.UserAlreadyParticipantError as exc:
+        # Raced with an existing membership; re-check to get the chat object.
+        rechecked = await retry_on_wait(
+            client, functions.messages.CheckChatInviteRequest(hash=invite_hash)
+        )
+        already = getattr(rechecked, "chat", None)
+        if already is None:
+            raise RuntimeError(
+                "already a member, but the chat could not be read"
+            ) from exc
+        return already
+    except errors.InviteRequestSentError as exc:
+        raise RuntimeError(
+            "a join request was sent; approve it first, then clone"
+        ) from exc
+
+    entity = channel_from_updates(joined)
+    info(f"Joined {utils.get_display_name(entity)} to read its history.")
+    return entity
+
+
 def channel_from_updates(updates: object) -> types.Channel:
     """Pull a channel out of an Updates envelope, or its nested result."""
     chats = getattr(updates, "chats", None)
@@ -1479,13 +1570,32 @@ async def reuploaded_media(
 
 
 async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
-    """Clone the current chat into a fresh private channel."""
-    source = await event.get_chat()
+    """Clone a chat into a fresh private channel.
+
+    With no link the current chat is cloned. A first argument that names a
+    chat, by invite link, public link or @handle, clones that chat instead
+    and any remaining words become the new title.
+    """
+    title_words = list(args)
+    if args and looks_like_chat_reference(args[0]):
+        await set_status(event, f"Resolving {args[0]}...")
+        try:
+            source = await resolve_clone_source(client, args[0])
+        except RuntimeError as exc:
+            await set_status(event, f"Cannot clone {args[0]}: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            await set_status(event, f"Cannot resolve {args[0]}: {exc}")
+            return
+        title_words = list(args[1:])
+    else:
+        source = await event.get_chat()
+
     if not is_supported_chat(source):
-        await set_status(event, "This chat cannot be cloned.")
+        await set_status(event, "That chat cannot be cloned.")
         return
 
-    title = " ".join(args).strip() or utils.get_display_name(source) or "Clone"
+    title = " ".join(title_words).strip() or utils.get_display_name(source) or "Clone"
     info(f"Cloning {utils.get_display_name(source)} into a private channel...")
     await set_status(event, f"Creating private channel {title!r}...")
 
@@ -1598,6 +1708,7 @@ COMMAND_HELP = (
     ".change @newname          replace every username in every post\n"
     ".change @oldname @newname replace only that username\n"
     ".clone [title]            clone this chat into a private channel\n"
+    ".clone <link> [title]     clone that chat, by invite link or @handle\n"
     ".help                     show this list"
 )
 

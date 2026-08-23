@@ -86,7 +86,31 @@ Editing is rate limited, so the run paces itself and waits out flood limits. Pos
 
 ## `.clone`
 
-Run it in a channel or group to copy the whole chat into a **fresh private channel** owned by you. An optional title overrides the default, which reuses the source title.
+Copies a whole chat into a **fresh private channel** owned by you.
+
+```text
+.clone                        clone the chat you are in
+.clone My Backup              clone this chat under a different title
+.clone https://t.me/+AbCdEf   clone that chat, from anywhere
+.clone @somechannel Archive   clone by handle, with a title
+```
+
+With no link it clones the current chat. A first argument that names a chat clones **that** chat instead, so you can run it from any chat — a saved-messages note to yourself, for instance. Anything after the link becomes the title; with no title the source name is reused.
+
+Accepted references: private invite links (`t.me/+hash` and the older `t.me/joinchat/hash`), public links (`t.me/name`), `@handles`, and private post links (`t.me/c/<id>`). A plain word is treated as a title, not a chat, so `.clone My Backup` still works as before.
+
+### Joining
+
+Invite links are inspected before any join attempt:
+
+- **Already a member** — used as it stands, no join, and it still clones. Joining twice would otherwise fail with `USER_ALREADY_PARTICIPANT`.
+- **Not a member** — joined first, since the history has to be readable. The account stays in the chat afterwards.
+- **Peek link** — some invites grant temporary read access; those clone without joining at all.
+- **Approval required** — reported instead of silently producing an empty clone, because a pending join request cannot read history.
+
+Public handles and links need no join, since public history is readable without membership.
+
+Expired and invalid invites are reported and nothing is created.
 
 - Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
 - Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.
@@ -329,9 +353,13 @@ Send `.delme` and it finds **every photo this account has sent**, along with its
 
 Both commands delete with revoke, so posts are removed for everyone, not just hidden from you.
 
+## Speed
+
+Chats are scanned several at a time, since each scan is mostly waiting on Telegram. `SCAN_CONCURRENCY` in `.env` sets how many run at once (default 8). Raise it to sweep a large account faster, lower it if you hit flood limits.
+
 ## Chats that reject a filtered search
 
-Some chats reject the server-side search that carries a sender or media filter (`INPUT_FILTER_INVALID`). When that happens the scan retries the same chat with a simpler query, down to a plain history scan filtered on the client, so those chats are still swept rather than skipped. The whole pass is buffered per attempt, so a query that fails part way through never leaves a partial result behind.
+Some chats reject the server-side search that carries a media filter (`INPUT_FILTER_INVALID`). When that happens the scan retries that chat with a plain history scan filtered on the client, so it is still swept rather than skipped. The whole pass is buffered per attempt, so a query that fails part way through never leaves a partial result behind. `.delme` filters photos server-side and checks the sender on the client, which avoids the sender-plus-filter combination that triggers this in the first place.
 
 ## Usage
 

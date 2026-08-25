@@ -1,11 +1,12 @@
 # Telethon Chat Tools
 
-Four Telethon userbot scripts:
+Five Telethon userbot scripts:
 
 - **`main.py`** copies every photo from one chat to another and posts a linked index, and also runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
 - **`lol.py`** deletes posts across your chats: `.delete <text>` removes every post containing a text in groups you moderate, and `.delme` removes every photo you sent, with its caption, everywhere. See [lol.py](#lolpy-delete-posts-by-text).
+- **`iam.py`** copies one account's whole profile onto the signed-in account, for rebuilding your own identity after losing access to it. See [iam.py](#iampy-copy-a-profile-onto-this-account).
 
 # main.py: Chat Photo Copier
 
@@ -372,6 +373,61 @@ Credentials come from `.env` (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_
 ## Caution
 
 `.confirm` deletes for everyone and cannot be undone. The preview names the count and the chats first for exactly this reason — read it before confirming. `.delme` in particular sweeps every chat you are in, so check the preview before you confirm it. A short `.delete` search (one character) is refused so an over-broad sweep is harder to trigger by mistake.
+
+# iam.py: Copy a Profile onto This Account
+
+Rebuilds an account's profile on a different account. The intended use is recovering your own identity after being logged out of an account you can no longer sign into: run the userbot as the **new** account, open a chat with the **old** one, and send `.this`.
+
+```text
+.this          copy the profile of the user in this chat
+.this @handle  copy that user's profile
+.this dry      show what would be copied, change nothing
+.help          show the commands
+```
+
+The target is the user whose chat you are in, or a reply's sender, or an explicit `@handle`. Run `.this dry` first to see what was found without touching anything.
+
+## What it copies
+
+| Field | Notes |
+|---|---|
+| First and last name | |
+| Bio | Telegram caps this at 70 characters; longer text is truncated and reported |
+| Username | Incremented when the old one is still taken, see below |
+| Profile photos | All of them, oldest uploaded first so the newest ends up current |
+| Emoji status | Premium |
+| Name colour and background emoji | Premium |
+| Profile colour and background emoji | Premium |
+| Birthday | Only if the old account shows it to you |
+| Business hours | Timezone and every weekly period |
+| Business location | Address and coordinates |
+| Business intro | Title, description and sticker |
+| Channel on the profile | Only if the new account can see that channel |
+
+## Usernames
+
+The exact username is tried first, in case the old account has since released it. Otherwise the trailing number is incremented: `name2` becomes `name3`, `karn9` becomes `karn10`, and a name with no number gains a `2`. Candidates outside Telegram's 5 to 32 character range are skipped, and each is checked for availability before being claimed. The report says which one it settled on and why.
+
+## Each field is independent
+
+Fields are applied one at a time and a failure never stops the rest. If the new account is not Premium, the emoji status and colours fail with "needs Telegram Premium" while the name, bio, username, photos, birthday and business fields still apply. The final report lists each field as applied, failed with a reason, or skipped because the old account had nothing to copy.
+
+## Limitations
+
+- **Animated profile photos become stills.** The frame is copied, not the video. The report says how many were affected so you can re-upload those manually.
+- **A collectible (NFT) emoji status cannot move between accounts.** The underlying base emoji is set instead, and the report says so.
+- **The profile channel** must be visible to the new account. Join it first, then re-run.
+- Anything the old account hides from you by privacy, such as a birthday, cannot be read and is reported as skipped.
+
+## Usage
+
+```bash
+python iam.py
+```
+
+`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` come from `.env`. The session is `IAM_SESSION` (default `iam_new_account`), kept separate so signing in as the new account does not disturb the session the other scripts use. `PHOTO_LIMIT` caps how many profile photos are copied (default 10).
+
+This writes over the signed-in account's own profile, which is the point, but there is no undo. `.this dry` shows the whole plan first.
 
 # Security
 

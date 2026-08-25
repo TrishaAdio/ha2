@@ -392,7 +392,7 @@ The target is the user whose chat you are in, or a reply's sender, or an explici
 | Field | Notes |
 |---|---|
 | First and last name | |
-| Bio | Telegram caps this at 70 characters; longer text is truncated and reported |
+| Bio | Trimmed to whatever limit **this** account has, see below |
 | Username | Incremented when the old one is still taken, see below |
 | Profile photos | All of them, oldest uploaded first so the newest ends up current |
 | Emoji status | Premium |
@@ -407,6 +407,14 @@ The target is the user whose chat you are in, or a reply's sender, or an explici
 ## Usernames
 
 The exact username is tried first, in case the old account has since released it. Otherwise the trailing number is incremented: `name2` becomes `name3`, `karn9` becomes `karn10`, and a name with no number gains a `2`. Candidates outside Telegram's 5 to 32 character range are skipped, and each is checked for availability before being claimed. The report says which one it settled on and why.
+
+## The bio limit
+
+Telegram allows a longer bio on Premium accounts, and the exact numbers are served in its live app config rather than being fixed. So the limit is read at runtime from `about_length_limit_premium` or `about_length_limit_default`, whichever applies to the account being written to — not the account being copied. Whatever Telegram currently says is what gets used.
+
+If the config cannot be read, the documented defaults of 140 for Premium and 70 otherwise are used, and the log says so. If Telegram still rejects the bio as too long, it is shrunk and retried, so a wrong limit cannot cost you the name as well.
+
+A Premium bio copied onto a non-Premium account is therefore trimmed, and the report says exactly that: `bio: 70 of 120 chars, trimmed to this account's 70 limit`.
 
 ## Each field is independent
 

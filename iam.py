@@ -42,8 +42,16 @@ LOG_FILE = "iam.log"
 MIN_USERNAME = 5
 MAX_USERNAME = 32
 USERNAME_TRIES = 30
-BIO_LIMIT = 70
 PHOTO_LIMIT_DEFAULT = 10
+
+# Bio limits are served live in Telegram's app config and differ per account,
+# so they are fetched at runtime. These are only the documented fallbacks for
+# when the config cannot be read.
+BIO_KEY_PREMIUM = "about_length_limit_premium"
+BIO_KEY_DEFAULT = "about_length_limit_default"
+BIO_FALLBACK_PREMIUM = 140
+BIO_FALLBACK_DEFAULT = 70
+BIO_SHRINK_STEPS = 6
 
 ASCII_BANNER = r"""
    _____   _____  ___
@@ -110,6 +118,41 @@ def photo_limit() -> int:
     """Return how many profile photos to copy at most."""
     raw = env_text("PHOTO_LIMIT")
     return int(raw) if raw.isdigit() and int(raw) > 0 else PHOTO_LIMIT_DEFAULT
+
+
+def config_number(config: object, key: str) -> int | None:
+    """Read one numeric value out of Telegram's app config object."""
+    for entry in getattr(config, "value", None) or []:
+        if entry.key == key:
+            value = getattr(entry.value, "value", None)
+            if isinstance(value, (int, float)):
+                return int(value)
+    return None
+
+
+async def fetch_bio_limit(client: TelegramClient, premium: bool) -> int:
+    """Ask Telegram how long a bio this account may set.
+
+    The limit differs between ordinary and Premium accounts and Telegram can
+    change it, so it is read from the live app config rather than assumed. The
+    documented defaults are only used when the config cannot be read.
+    """
+    key = BIO_KEY_PREMIUM if premium else BIO_KEY_DEFAULT
+    fallback = BIO_FALLBACK_PREMIUM if premium else BIO_FALLBACK_DEFAULT
+    try:
+        app_config = await resilient(
+            client, functions.help.GetAppConfigRequest(hash=0), label="read app config"
+        )
+        limit = config_number(getattr(app_config, "config", None), key)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Could not read %s (%s); using %s.", key, exc, fallback)
+        return fallback
+
+    if limit is None or limit <= 0:
+        LOG.warning("%s missing from app config; using %s.", key, fallback)
+        return fallback
+    LOG.info("Bio limit for this account: %s characters (%s).", limit, key)
+    return limit
 
 
 # ---------------------------------------------------------------------------
@@ -292,28 +335,50 @@ def describe_reason(exc: Exception) -> str:
     return str(exc) or type(exc).__name__
 
 
-async def apply_names(client: TelegramClient, snap: Snapshot, report: Report) -> None:
-    """Copy the first name, last name and bio."""
-    about = (snap.about or "")[:BIO_LIMIT]
-    try:
-        await resilient(
-            client,
-            functions.account.UpdateProfileRequest(
-                first_name=snap.user.first_name or "",
-                last_name=snap.user.last_name or "",
-                about=about,
-            ),
-            label="set name and bio",
-        )
-    except Exception as exc:  # noqa: BLE001
-        report.fail("name and bio", describe_reason(exc))
-        return
+async def apply_names(
+    client: TelegramClient, snap: Snapshot, report: Report, limit: int
+) -> None:
+    """Copy the first name, last name and bio, within this account's bio limit.
+
+    If Telegram still calls the bio too long, it is shrunk and retried, so a
+    stale limit cannot cost us the name as well.
+    """
+    original = snap.about or ""
+    about = original[:limit]
+    applied_length: int | None = None
+
+    for step in range(BIO_SHRINK_STEPS):
+        try:
+            await resilient(
+                client,
+                functions.account.UpdateProfileRequest(
+                    first_name=snap.user.first_name or "",
+                    last_name=snap.user.last_name or "",
+                    about=about,
+                ),
+                label="set name and bio",
+            )
+        except errors.AboutTooLongError:
+            if step == BIO_SHRINK_STEPS - 1 or not about:
+                report.fail("bio", f"still too long at {len(about)} chars")
+                return
+            about = about[: max(1, int(len(about) * 0.8))]
+            LOG.warning("Bio rejected as too long; retrying at %s chars.", len(about))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            report.fail("name and bio", describe_reason(exc))
+            return
+        applied_length = len(about)
+        break
+
     report.ok("name", utils.get_display_name(snap.user) or "(empty)")
-    if snap.about:
-        truncated = " (truncated)" if len(snap.about) > BIO_LIMIT else ""
-        report.ok("bio", f"{len(about)} chars{truncated}")
-    else:
+    if not original:
         report.skip("bio", "the old account has none")
+        return
+    detail = f"{applied_length} of {len(original)} chars"
+    if applied_length is not None and applied_length < len(original):
+        detail += f", trimmed to this account's {limit} limit"
+    report.ok("bio", detail)
 
 
 async def apply_username(client: TelegramClient, snap: Snapshot, report: Report) -> None:
@@ -559,7 +624,7 @@ async def set_status(event: object, text: str) -> None:
         await event.edit(text)
 
 
-def preview(snap: Snapshot) -> str:
+def preview(snap: Snapshot, bio_limit: int) -> str:
     """Describe what a real run would copy."""
     lines = [f"Would copy from {snap.name}:"]
     lines.append(f"  name: {utils.get_display_name(snap.user) or '(empty)'}")
@@ -567,7 +632,9 @@ def preview(snap: Snapshot) -> str:
     if snap.username:
         options = list(username_variants(snap.username))[:3]
         lines.append(f"  username tries: {', '.join('@' + o for o in options)}")
-    lines.append(f"  bio: {len(snap.about or '')} chars")
+    length = len(snap.about or "")
+    over = f", over this account's {bio_limit} limit" if length > bio_limit else ""
+    lines.append(f"  bio: {length} chars (limit {bio_limit}{over})")
     lines.append(f"  profile photos: {len(snap.photos)}")
     status = snap.emoji_document_id
     lines.append(f"  emoji status: {status if status else 'none'}")
@@ -618,15 +685,24 @@ async def command_this(client: TelegramClient, event: object, args: list[str]) -
     LOG.info("Read profile of %s.", snap.name)
 
     if dry:
-        await set_status(event, preview(snap))
+        me = await client.get_me()
+        limit = await fetch_bio_limit(client, bool(me and me.premium))
+        await set_status(event, preview(snap, limit))
         return
 
-    if not snap.user.premium:
-        LOG.warning("The old account is not Premium; colours and status may not apply.")
+    # The bio limit that matters belongs to the account being written to.
+    me = await client.get_me()
+    limit = await fetch_bio_limit(client, bool(me and me.premium))
+    if me is not None and not me.premium and snap.user.premium:
+        LOG.warning(
+            "The old account is Premium but this one is not; the bio limit is %s "
+            "here and colours and emoji status will be refused.",
+            limit,
+        )
 
     await set_status(event, f"Copying {snap.name} onto this account...")
     report = Report()
-    await apply_names(client, snap, report)
+    await apply_names(client, snap, report, limit)
     await apply_username(client, snap, report)
     await apply_photos(client, snap, report)
     await apply_emoji_status(client, snap, report)

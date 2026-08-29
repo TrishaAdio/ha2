@@ -42,6 +42,10 @@ INDEX_CUSTOM_EMOJI_ID = 6298751564592973547
 INDEX_TITLE_SUFFIX = " | Demo"
 GENERAL_TOPIC_ID = 1
 TOPIC_LIST_LIMIT = 100
+# Telegram refuses a message over 4096 characters, and accepts about a hundred
+# entities in one; both are counted in UTF-16 units, with a margin left over.
+MAX_INDEX_UNITS = 3900
+MAX_INDEX_ENTITIES = 95
 ASCII_BANNER = r"""
    ________                     __   ______            _
   / ____/ /_  ____ _____  ____  / /  / ____/___  ____  (_)__  _____
@@ -634,8 +638,8 @@ def is_emoji_character(character: str) -> bool:
         codepoint in {0x00A9, 0x00AE, 0x200D, 0x203C, 0x2049, 0x20E3, 0x2122}
         or 0x2190 <= codepoint <= 0x21FF
         or 0x2300 <= codepoint <= 0x23FF
-        or 0x2460 <= codepoint <= 0x24FF
-        or 0x25A0 <= codepoint <= 0x27BF
+        # 0x2460-0x24FF (①⑵⒊) and 0x2776-0x2793 (❶➁➌) are numbering, not emoji.
+        or (0x25A0 <= codepoint <= 0x27BF and not 0x2776 <= codepoint <= 0x2793)
         or 0x2B00 <= codepoint <= 0x2BFF
         or 0x1F000 <= codepoint <= 0x1FAFF
         or 0xE0020 <= codepoint <= 0xE007F
@@ -644,13 +648,16 @@ def is_emoji_character(character: str) -> bool:
 
 
 def remove_caption_emoji(value: str) -> str:
-    """Remove ordinary emoji and normalize whitespace for an index title."""
+    """Remove ordinary emoji and normalize whitespace for an index title.
+
+    Numbering is kept. Channels number their posts with keycaps (1️⃣) or circled
+    digits (①, ❶); dropping those left every index entry looking alike, so the
+    keycap decoration goes and the digit underneath stays.
+    """
     characters: list[str] = []
     for character in value:
-        if ord(character) == 0x20E3 and characters:
-            if characters[-1] in "#*0123456789":
-                characters.pop()
-            continue
+        if ord(character) == 0x20E3:
+            continue  # combining keycap: the digit before it is the number
         if not is_emoji_character(character):
             characters.append(character)
     return " ".join("".join(characters).split())
@@ -687,10 +694,16 @@ def utf16_length(value: str) -> int:
 
 def make_index_messages(
     entries: Iterable[IndexEntry],
-    max_units: int = 3900,
-    max_entries: int = 20,
+    max_units: int = MAX_INDEX_UNITS,
+    max_entities: int = MAX_INDEX_ENTITIES,
 ) -> Iterable[tuple[str, list[types.TypeMessageEntity]]]:
-    """Build blockquoted index messages with custom-emoji linked titles."""
+    """Build blockquoted index messages with custom-emoji linked titles.
+
+    A new message is started only when the next entry would break one of
+    Telegram's own limits: the 4096-character text limit, or its cap of about a
+    hundred entities per message. A fixed entry count per message used to split
+    a short index into several messages for no reason.
+    """
     text = ""
     line_entities: list[types.TypeMessageEntity] = []
     entry_count = 0
@@ -706,9 +719,12 @@ def make_index_messages(
     for entry in entries:
         display_title = f"{entry.title}{INDEX_TITLE_SUFFIX}"
         addition = f"{INDEX_CUSTOM_EMOJI} {display_title}\n"
+        # Marker + bold title, plus the link when there is one, and one
+        # blockquote wrapping whatever this message ends up holding.
+        needed = 2 + (1 if entry.url else 0)
         if entry_count and (
             utf16_length(text + addition) > max_units
-            or entry_count >= max_entries
+            or len(line_entities) + needed + 1 > max_entities
         ):
             yield finish_chunk()
             text = ""
@@ -733,17 +749,39 @@ def make_index_messages(
                     url=entry.url,
                 )
             )
-        line_entities.extend(
-            [
-                types.MessageEntityBold(offset=title_offset, length=title_length),
-                types.MessageEntityUnderline(offset=title_offset, length=title_length),
-            ]
+        # Bold only: underlining a link as well spent a third of the entity
+        # budget on decoration, which is what forced the extra messages.
+        line_entities.append(
+            types.MessageEntityBold(offset=title_offset, length=title_length)
         )
         text += addition
         entry_count += 1
 
     if entry_count:
         yield finish_chunk()
+
+
+def looks_like_index(message: Message) -> bool:
+    """Return whether a message is an index this tool posted before.
+
+    Index messages carry no media, are wrapped in a blockquote, and every line
+    starts with the marker emoji followed by a titled entry.
+    """
+    if message.media is not None or not message.message:
+        return False
+    entities = message.entities or []
+    has_blockquote = any(
+        isinstance(entity, types.MessageEntityBlockquote) for entity in entities
+    )
+    if not has_blockquote:
+        return False
+    return INDEX_CUSTOM_EMOJI in message.message and INDEX_TITLE_SUFFIX in message.message
+
+
+def is_index_sticker(message: Message) -> bool:
+    """Return whether a message is the sticker that precedes an index."""
+    document = getattr(message, "document", None)
+    return bool(document and document.id == INDEX_STICKER.id)
 
 
 def without_custom_emoji(
@@ -1493,6 +1531,10 @@ async def iter_clone_batches(
         if message.action is not None:
             continue
         if not message.message and message.media is None:
+            continue
+        if is_index_sticker(message) or looks_like_index(message):
+            # The source's own index points at the source. A fresh one is
+            # posted at the end, so copying this would leave two.
             continue
 
         if message.grouped_id is None:

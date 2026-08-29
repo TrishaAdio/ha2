@@ -36,6 +36,8 @@ from main import (
     caption_position,
     entity_username,
     index_title,
+    is_index_sticker,
+    looks_like_index,
     make_index_messages,
     message_link,
     without_custom_emoji,
@@ -291,29 +293,6 @@ class GroupScan:
         """Return the public link, or a private marker."""
         username = entity_username(self.group)
         return f"t.me/{username}" if username else f"private id {self.group.id}"
-
-
-def looks_like_index(message: Message) -> bool:
-    """Return whether a message is an index this tool posted before.
-
-    Index messages carry no media, are wrapped in a blockquote, and every line
-    starts with the marker emoji followed by a titled entry.
-    """
-    if message.media is not None or not message.message:
-        return False
-    entities = message.entities or []
-    has_blockquote = any(
-        isinstance(entity, types.MessageEntityBlockquote) for entity in entities
-    )
-    if not has_blockquote:
-        return False
-    return INDEX_CUSTOM_EMOJI in message.message and INDEX_TITLE_SUFFIX in message.message
-
-
-def is_index_sticker(message: Message) -> bool:
-    """Return whether a message is the sticker that precedes an index."""
-    document = getattr(message, "document", None)
-    return bool(document and document.id == INDEX_STICKER.id)
 
 
 async def scan_group(

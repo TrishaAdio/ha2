@@ -14,6 +14,7 @@ import copy
 import getpass
 import os
 import re
+import sys
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,14 @@ from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.tl.custom import Dialog, Message
+
+if sys.version_info < (3, 10):
+    # zip(..., strict=...) is used throughout; on 3.9 it raises TypeError deep
+    # inside a run, which looks like a Telegram problem rather than a version one.
+    raise SystemExit(
+        "This tool needs Python 3.10 or newer "
+        f"(running {sys.version_info.major}.{sys.version_info.minor})."
+    )
 
 ChatEntity = Union[types.Channel, types.Chat]
 Result = TypeVar("Result")
@@ -748,14 +757,13 @@ def without_custom_emoji(
     ]
 
 
-async def send_index_sticker(client: TelegramClient, destination: CopyTarget) -> bool:
+async def send_index_sticker(
+    client: TelegramClient, entity: ChatEntity, reply_to: int | None
+) -> bool:
     """Send the index sticker, reporting failures without stopping the run."""
     try:
         await retry_on_wait(
-            client.send_file,
-            destination.entity,
-            INDEX_STICKER,
-            reply_to=destination.reply_to_topic,
+            client.send_file, entity, INDEX_STICKER, reply_to=reply_to
         )
         return True
     except Exception as exc:  # A stale sticker reference must not lose the index.
@@ -765,42 +773,49 @@ async def send_index_sticker(client: TelegramClient, destination: CopyTarget) ->
 
 async def send_index_chunk(
     client: TelegramClient,
-    destination: CopyTarget,
+    entity: ChatEntity,
+    reply_to: int | None,
     text: str,
     entities: Sequence[types.TypeMessageEntity],
 ) -> None:
     """Send one styled index message into the destination chat or topic."""
     await retry_on_wait(
         client.send_message,
-        destination.entity,
+        entity,
         text,
         formatting_entities=list(entities),
-        reply_to=destination.reply_to_topic,
+        reply_to=reply_to,
         link_preview=False,
     )
 
 
 async def post_index(
     client: TelegramClient,
-    destination: CopyTarget,
+    entity: ChatEntity,
+    reply_to: int | None,
     entries: Sequence[IndexEntry],
 ) -> int:
-    """Send the index sticker, then all styled linked-index chunks."""
+    """Send the index sticker, then all styled linked-index chunks.
+
+    Takes a bare chat rather than a CopyTarget so that both the interactive
+    copier and .clone, which creates its destination and has no Dialog for it,
+    can post the same index.
+    """
     if not entries:
         return 0
 
-    await send_index_sticker(client, destination)
+    await send_index_sticker(client, entity, reply_to)
 
     count = 0
     for text, entities in make_index_messages(entries):
         try:
-            await send_index_chunk(client, destination, text, entities)
+            await send_index_chunk(client, entity, reply_to, text, entities)
         except Exception as exc:
             # Custom emoji need Telegram Premium; retry with the plain emoji.
             warning(f"Styled index chunk failed ({exc}); retrying without custom emoji.")
             try:
                 await send_index_chunk(
-                    client, destination, text, without_custom_emoji(entities)
+                    client, entity, reply_to, text, without_custom_emoji(entities)
                 )
             except Exception as retry_exc:
                 failure(f"Index chunk failed: {retry_exc}")
@@ -906,7 +921,9 @@ async def run_copy(client: TelegramClient) -> None:
         copied_photo_ids,
     )
     info("Sending final sticker and styled index...")
-    index_messages = await post_index(client, destination, index_entries)
+    index_messages = await post_index(
+        client, destination.entity, destination.reply_to_topic, index_entries
+    )
     print(Fore.GREEN + Style.BRIGHT + "\n========== COPY COMPLETE ==========")
     success(f"Photos copied: {copied_photos}")
     success(f"Photo posts/albums copied: {copied_posts}")
@@ -1306,21 +1323,26 @@ async def repoint_clone_links(
     client: TelegramClient,
     links: CloneLinks,
     pending: Sequence[tuple[int, Message]],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Edit cloned posts so their links point inside the clone.
 
     This runs after copying finishes, because a post may link forward to one
     that had not been cloned yet while the copy was still in progress.
+
+    Returns (repointed, left alone, failed). A post is left alone when every
+    link in it points at something that was never cloned, which is a normal
+    outcome and not a failure.
     """
     repointed = 0
-    unresolved = 0
+    untouched = 0
+    failed = 0
     for new_id, source_message in pending:
         text = source_message.message or ""
         result = apply_text_rewrites(
             text, source_message.entities, links.rewrites(text), links.relink
         )
         if result is None:
-            unresolved += 1
+            untouched += 1
             continue
 
         new_text, new_entities = result
@@ -1335,12 +1357,12 @@ async def repoint_clone_links(
             )
             repointed += 1
         except errors.MessageNotModifiedError:
-            unresolved += 1
+            untouched += 1
         except Exception as exc:  # noqa: BLE001
-            unresolved += 1
+            failed += 1
             failure(f"Could not repoint links in cloned post {new_id}: {exc}")
         await asyncio.sleep(EDIT_DELAY)
-    return repointed, unresolved
+    return repointed, untouched, failed
 
 
 # A private invite link, either the modern +hash form or the old joinchat one.
@@ -1569,12 +1591,40 @@ async def reuploaded_media(
     )
 
 
+def clone_index_entry(
+    batch: Sequence[Message],
+    sent: Sequence[Message],
+    target: types.Channel,
+) -> IndexEntry | None:
+    """Build the index entry for one cloned post, or None when it needs none.
+
+    Only media posts are indexed, matching reindex.py: a plain text post is a
+    post, not a caption, so it never becomes an index title.
+    """
+    position = caption_position(batch)
+    if position is None:
+        return None
+    source_message = batch[position]
+    if source_message.media is None or isinstance(
+        source_message.media, types.MessageMediaWebPage
+    ):
+        return None
+    title = index_title(source_message.message)
+    if not title:
+        return None
+    cloned = sent[min(position, len(sent) - 1)]
+    return IndexEntry(title=title, url=message_link(target, cloned.id))
+
+
 async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
     """Clone a chat into a fresh private channel.
 
     With no link the current chat is cloned. A first argument that names a
     chat, by invite link, public link or @handle, clones that chat instead
     and any remaining words become the new title.
+
+    Once every post is copied, links between posts are repointed at the clone
+    and the styled linked index is posted, so the clone needs no reindex.py run.
     """
     title_words = list(args)
     if args and looks_like_chat_reference(args[0]):
@@ -1617,6 +1667,7 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         id_map=id_map,
     )
     pending_links: list[tuple[int, Message]] = []
+    index_entries: list[IndexEntry] = []
     copied = skipped = failed = 0
     await set_status(event, f"Cloning into {title!r}...")
 
@@ -1656,17 +1707,33 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
             id_map[source_message.id] = new_message.id
             if links.present_in(source_message):
                 pending_links.append((new_message.id, source_message))
+        entry = clone_index_entry(batch, sent, target)
+        if entry is not None:
+            index_entries.append(entry)
         copied += len(batch)
         if copied % STATUS_EVERY == 0:
             await set_status(event, f"Cloning into {title!r}... {copied} posts")
         await asyncio.sleep(CLONE_DELAY)
 
-    repointed = unresolved = 0
+    repointed = untouched = link_failures = 0
     if pending_links:
         info(f"Repointing links in {len(pending_links)} cloned post(s)...")
         await set_status(event, f"Repointing links in {len(pending_links)} post(s)...")
-        repointed, unresolved = await repoint_clone_links(client, links, pending_links)
+        repointed, untouched, link_failures = await repoint_clone_links(
+            client, links, pending_links
+        )
         success(f"Repointed links in {repointed} post(s).")
+    else:
+        info("No post carried a link to the source, so none needed repointing.")
+
+    index_messages = 0
+    if index_entries:
+        info(f"Posting the linked index for {len(index_entries)} post(s)...")
+        await set_status(event, f"Posting the index for {len(index_entries)} post(s)...")
+        index_messages = await post_index(client, target, None, index_entries)
+        success(f"Index posted in {index_messages} message(s).")
+    else:
+        info("No caption produced an index title, so no index was posted.")
 
     exported = await retry_on_wait(
         client,
@@ -1675,10 +1742,14 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     link = getattr(exported, "link", None) or "no link returned"
 
     report = f"Cloned {copied} post(s) into {title!r}\n{link}"
+    if index_entries:
+        report += f"\nIndex: {len(index_entries)} entries in {index_messages} message(s)"
     if repointed:
         report += f"\nLinks repointed at the clone: {repointed}"
-    if unresolved:
-        report += f"\nLinks left pointing at the source: {unresolved}"
+    if untouched:
+        report += f"\nLinks left pointing at the source: {untouched}"
+    if link_failures:
+        report += f"\nLinks that could not be edited: {link_failures}"
     if skipped:
         report += f"\nSkipped: {skipped}"
     if failed:
@@ -1707,7 +1778,7 @@ COMMAND_HELP = (
     "Commands\n"
     ".change @newname          replace every username in every post\n"
     ".change @oldname @newname replace only that username\n"
-    ".clone [title]            clone this chat into a private channel\n"
+    ".clone [title]            clone this chat, with its linked index\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"
     ".help                     show this list"
 )

@@ -1014,14 +1014,13 @@ class SourceScan:
     """The numbered posts of a source, and where its own index sat."""
 
     posts: list[SourcePost] = field(default_factory=list)
-    # How many kept posts came before the source's own index, so the clone can
-    # put its index back in the same place. None means the source had none.
+    # How many posts came before the source's own index, so the clone can put
+    # its index back in the same place. None means the source had none.
     index_after: int | None = None
-    skipped: int = 0  # Posts the caption filter rejected.
 
 
 def caption_filter_pattern(word: str) -> re.Pattern[str] | None:
-    """Compile a caption filter, or None when everything should be cloned."""
+    """Compile the index filter, or None when every post should be listed."""
     word = word.strip()
     if not word:
         return None
@@ -1038,11 +1037,12 @@ def has_real_media(message: Message) -> bool:
 def matches_caption_filter(
     messages: Sequence[Message], pattern: re.Pattern[str] | None
 ) -> bool:
-    """Return whether a post is media with the filter word in its caption.
+    """Return whether a post belongs in the index.
 
-    Both halves matter: a post with no media is not what the filter is for, and
-    a caption is checked across every part of an album because Telegram stores
-    it on whichever part the sender typed it on.
+    This decides what the index lists, never what gets cloned: every post is
+    copied either way. Both halves matter here: a post with no media is not
+    what the filter is for, and the caption is checked across every part of an
+    album because Telegram stores it on whichever part the sender typed it on.
     """
     if pattern is None:
         return True
@@ -1059,9 +1059,12 @@ async def collect_source_posts(
     source: PeerRef,
     suffix: str,
     limit: int | None = None,
-    caption_filter: str = "",
 ) -> SourceScan:
     """Read every content post of a source, oldest first, and number them.
+
+    Every post is kept: media, plain text, and the text replies hanging off a
+    media post are all part of the channel and all get cloned. What the index
+    lists is decided separately, in build_index_entries.
 
     Numbering happens here, in one pass, before a single message is sent. That
     is the whole point: once a post owns a number, nothing that happens later
@@ -1075,15 +1078,11 @@ async def collect_source_posts(
     end.
     """
     scan = SourceScan()
-    pattern = caption_filter_pattern(caption_filter)
     album: list[Message] = []
     album_id: int | None = None
 
     def keep(messages: list[Message]) -> None:
-        """Number and keep a post, unless the caption filter rejects it."""
-        if not matches_caption_filter(messages, pattern):
-            scan.skipped += 1
-            return
+        """Number and keep a post."""
         scan.posts.append(
             SourcePost(ordinal=len(scan.posts) + 1, messages=messages)
         )
@@ -1136,7 +1135,7 @@ async def collect_source_posts(
 
     if limit is not None:
         del scan.posts[limit:]
-    # An index recorded beyond the posts that survived is simply the end.
+    # An index recorded beyond the posts that were kept is simply the end.
     if scan.index_after is not None and scan.index_after > len(scan.posts):
         scan.index_after = len(scan.posts)
     return scan
@@ -1406,18 +1405,25 @@ def build_index_entries(
     posts: Sequence[SourcePost],
     results: Sequence[PostResult],
     target: PeerRef,
+    caption_filter: str = "",
 ) -> list[IndexEntry]:
-    """Build one index entry per source post, in source order.
+    """Build the index lines, in source order.
 
-    One line per post, always. main.py indexed only posts that both carried
-    media and produced a title, so a plain text post or a caption made entirely
-    of emoji shifted every later line: the channel's 3rd post showed up as the
-    index's 2nd. Here a post with no usable caption is still line N, and a post
-    that failed to clone is line N without a link.
+    The filter belongs here and nowhere else: every post is cloned regardless,
+    and a post the filter rejects simply gets no line in the index.
+
+    With no filter there is one line per post, always. main.py indexed only
+    posts that both carried media and produced a title, so a plain text post or
+    a caption made entirely of emoji shifted every later line: the channel's
+    3rd post showed up as the index's 2nd. Here a post with no usable caption is
+    still a line, and a post that failed to clone is a line without a link.
     """
+    pattern = caption_filter_pattern(caption_filter)
     by_ordinal = {result.ordinal: result for result in results}
     entries: list[IndexEntry] = []
     for post in posts:
+        if not matches_caption_filter(post.messages, pattern):
+            continue
         position = caption_position(post.messages)
         title = (
             index_title(getattr(post.messages[position], "message", None))
@@ -1579,7 +1585,7 @@ class CloneReport:
     # Kept so .test can read the source back and prove the order survived.
     source_posts: list[SourcePost] = field(default_factory=list)
     results: list[PostResult] = field(default_factory=list)
-    skipped: int = 0  # Posts the caption filter rejected.
+    indexed: int = 0  # Posts the index lists; the rest are cloned but unlisted.
     index_after: int = 0  # Posts published before the index.
     photo_copied: bool = False
 
@@ -1677,25 +1683,11 @@ async def clone_source(
     """Copy a source into a brand new channel and index it."""
     source = slot.source
     LOG.info("Reading %s...", source.title)
-    scan = await collect_source_posts(client, source, suffix, limit, caption_filter)
+    scan = await collect_source_posts(client, source, suffix, limit)
     posts = scan.posts
     if not posts:
-        if scan.skipped:
-            raise RuntimeError(
-                f"no post in {source.title} has {caption_filter!r} in its caption "
-                f"({scan.skipped} skipped)"
-            )
         raise RuntimeError(f"{source.title} has no posts to clone")
-    if scan.skipped:
-        LOG.info(
-            "%s: %s post(s) match %r, %s skipped.",
-            source.title,
-            len(posts),
-            caption_filter,
-            scan.skipped,
-        )
-    else:
-        LOG.info("%s: %s post(s) to clone.", source.title, len(posts))
+    LOG.info("%s: %s post(s) to clone.", source.title, len(posts))
 
     target = await create_clone_channel(client, slot.clone_title())
 
@@ -1715,7 +1707,7 @@ async def clone_source(
     async def place_index() -> None:
         """Post the index here, with whatever links already exist."""
         nonlocal posted_index
-        entries = build_index_entries(posts, results, target)
+        entries = build_index_entries(posts, results, target, caption_filter)
         posted_index = await post_index(client, target, entries, suffix)
 
     for post in posts:
@@ -1751,7 +1743,7 @@ async def clone_source(
         LOG.warning("%s: could not copy the profile photo: %s", slot.name, exc)
 
     # Now that every post exists, the index lines can point at them.
-    entries = build_index_entries(posts, results, target)
+    entries = build_index_entries(posts, results, target, caption_filter)
     refreshed = await refresh_index(client, target, posted_index, entries, suffix)
     if refreshed:
         LOG.info("%s: filled in %s index message(s).", slot.name, refreshed)
@@ -1782,7 +1774,7 @@ async def clone_source(
         total=len(posts),
         source_posts=posts,
         results=results,
-        skipped=scan.skipped,
+        indexed=len(entries),
         index_after=index_after,
         photo_copied=photo_copied,
     )
@@ -2104,7 +2096,7 @@ COMMAND_HELP = (
     f".interval MINUTES         rotation interval, {MIN_INTERVAL_MINUTES} or more\n"
     ".clones N                 clones to create per source each cycle\n"
     ".links N                  times each invite link is repeated\n"
-    ".filter WORD | off        clone only posts with WORD in the caption\n"
+    ".filter WORD | off        index only posts with WORD in the caption\n"
     ".start                    start rotating\n"
     ".stop                     stop rotating and wipe the live clones\n"
     ".rotate                   wipe and rebuild now\n"
@@ -2283,26 +2275,29 @@ async def command_links(runtime: Runtime, event: object, args: list[str]) -> Non
 
 
 async def command_filter(runtime: Runtime, event: object, args: list[str]) -> None:
-    """Set the caption word a post must carry to be cloned."""
+    """Set the caption word a post needs to appear in the index.
+
+    This never changes what gets cloned; every post is copied either way.
+    """
     state = runtime.state
     if not args:
         current = state.caption_filter or "off"
-        await set_status(event, f"Caption filter: {current}")
+        await set_status(event, f"Index filter: {current}")
         return
     word = args[0]
     if word.lower() in {"off", "none", "-"}:
         state.caption_filter = ""
         state.save()
-        LOG.info("Caption filter cleared.")
-        await set_status(event, "Caption filter: off")
+        LOG.info("Index filter cleared; every post will be listed.")
+        await set_status(event, "Index filter: off")
         return
     if len(word) > 64:
         await set_status(event, "That filter word is too long.")
         return
     state.caption_filter = word
     state.save()
-    LOG.info("Caption filter set to %r.", word)
-    await set_status(event, f"Caption filter: {word}")
+    LOG.info("Index filter set to %r.", word)
+    await set_status(event, f"Index filter: {word}")
 
 
 async def command_start(runtime: Runtime, event: object, args: list[str]) -> None:
@@ -2384,10 +2379,7 @@ async def run_slot_test(
         limit=posts,
         caption_filter=state.caption_filter,
     )
-    sampled = f"{report.total} post(s) sampled"
-    if state.caption_filter:
-        sampled += f", {report.skipped} without {state.caption_filter!r} skipped"
-    lines.append(f"source      {slot.source.title}, {sampled}")
+    lines.append(f"source      {slot.source.title}, {report.total} post(s) sampled")
     lines.append(f"channel     created as {report.peer.title}")
     lines.append(f"photo       {'copied' if report.photo_copied else 'none to copy'}")
 
@@ -2411,7 +2403,19 @@ async def run_slot_test(
             if report.index_after >= report.total
             else f"after post {report.index_after}, as in the source"
         )
-        lines.append(f"index       {report.index_messages} message(s) {placed}")
+        listed = f"{report.indexed}/{report.total} post(s) listed"
+        if state.caption_filter:
+            listed += f" (caption has {state.caption_filter!r})"
+        lines.append(
+            f"index       {report.index_messages} message(s) {placed}, {listed}"
+        )
+    elif report.indexed == 0:
+        listed = (
+            f"no caption has {state.caption_filter!r}"
+            if state.caption_filter
+            else "nothing to list"
+        )
+        lines.append(f"index       not posted, {listed}")
     else:
         ok = False
         lines.append("index       not posted")
@@ -2516,7 +2520,7 @@ async def command_status(runtime: Runtime, event: object, args: list[str]) -> No
         f"Interval: {state.interval_minutes} minutes",
         f"Clones per source: {state.clones_per_source}",
         f"Link lines per clone: {state.link_repeat}",
-        f"Caption filter: {state.caption_filter or 'off'}",
+        f"Index filter: {state.caption_filter or 'off'}",
         f"Cycle: {state.cycle}",
     ]
     if state.published_at:
@@ -2611,7 +2615,7 @@ async def main() -> None:
         state.save()
         LOG.info(
             "First run: interval %s minutes, %s clone(s) per source, "
-            "%s link line(s), caption filter %s.",
+            "%s link line(s), index filter %s.",
             state.interval_minutes,
             state.clones_per_source,
             state.link_repeat,

@@ -332,9 +332,10 @@ def collect_settings(existing: dict[str, str]) -> dict[str, str]:
         1,
     )
 
-    heading("what gets cloned")
-    info("Only media posts whose caption mentions this word are cloned.")
-    info("'-' clones every post instead.")
+    heading("what the index lists")
+    info("Every post is cloned. This only decides which ones the index lists.")
+    info("Only media posts whose caption mentions this word get a line.")
+    info("'-' lists every post instead.")
     caption_filter = ask(
         "Caption must mention", existing.get("REDIRECT_FILTER", DEFAULT_CAPTION_FILTER)
     )

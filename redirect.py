@@ -55,6 +55,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 import time
@@ -106,11 +107,22 @@ EDIT_DELAY = 0.4
 DELETE_CHUNK = 100
 DEFAULT_TEST_POSTS = 3
 
+# How a source that has no index block of its own gets one: text then sticker,
+# which is the arrangement the channels this was built for use.
+DEFAULT_INDEX_ORDER = ("index", "sticker")
+
 # How many times the invite link is repeated in the link post, one per line.
 DEFAULT_LINK_REPEAT = 5
 MAX_LINK_REPEAT = 50
 # Only posts whose caption mentions this word are cloned. Empty means all.
 DEFAULT_CAPTION_FILTER = "Dm"
+
+# One divider sticker per this many posts, through the runs the source leaves
+# undivided. 0 turns it off.
+DEFAULT_SEPARATOR_EVERY = 2
+# How many times a sticker must appear before it counts as the divider rather
+# than as a one-off decoration.
+MIN_DIVIDER_REPEATS = 2
 TICK_SECONDS = 5.0
 SLOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
@@ -214,6 +226,7 @@ class Settings:
     clones_per_source: int
     link_repeat: int
     caption_filter: str
+    separator_every: int
 
 
 def env_text(name: str, default: str = "") -> str:
@@ -283,6 +296,9 @@ def read_settings() -> Settings:
             DEFAULT_CAPTION_FILTER
             if os.getenv("REDIRECT_FILTER") is None
             else env_text("REDIRECT_FILTER")
+        ),
+        separator_every=env_int(
+            "REDIRECT_SEPARATOR", DEFAULT_SEPARATOR_EVERY, 0
         ),
     )
 
@@ -556,6 +572,7 @@ class State:
     clones_per_source: int = 1
     link_repeat: int = DEFAULT_LINK_REPEAT
     caption_filter: str = DEFAULT_CAPTION_FILTER
+    separator_every: int = DEFAULT_SEPARATOR_EVERY
     running: bool = False
     cycle: int = 0
     published_at: float = 0.0
@@ -584,6 +601,7 @@ class State:
             "clones_per_source": self.clones_per_source,
             "link_repeat": self.link_repeat,
             "caption_filter": self.caption_filter,
+            "separator_every": self.separator_every,
             "running": self.running,
             "cycle": self.cycle,
             "published_at": self.published_at,
@@ -621,6 +639,12 @@ class State:
         stored_filter = payload.get("caption_filter")
         state.caption_filter = (
             DEFAULT_CAPTION_FILTER if stored_filter is None else str(stored_filter)
+        )
+        stored_separator = payload.get("separator_every")
+        state.separator_every = (
+            DEFAULT_SEPARATOR_EVERY
+            if stored_separator is None
+            else max(0, int(stored_separator))
         )
         state.running = bool(payload.get("running"))
         state.cycle = int(payload.get("cycle") or 0)
@@ -988,9 +1012,161 @@ def looks_like_our_index(message: Message, suffix: str) -> bool:
 
 
 def is_index_sticker(message: Message) -> bool:
-    """Return whether a post is the sticker that introduces an index."""
+    """Return whether a post is the exact sticker this tool ships with."""
     document = getattr(message, "document", None)
     return bool(document and document.id == INDEX_STICKER.id)
+
+
+def is_sticker_message(message: Message) -> bool:
+    """Return whether a post is a sticker, whichever sticker it is."""
+    document = getattr(message, "document", None)
+    if document is None:
+        return False
+    return any(
+        isinstance(attribute, types.DocumentAttributeSticker)
+        for attribute in getattr(document, "attributes", None) or []
+    )
+
+
+def index_block_kind(
+    message: Message, suffix: str, divider_id: int | None = None
+) -> str | None:
+    """Classify a post as part of an index block, or None for real content.
+
+    A sticker known to be the channel's divider is content, never part of the
+    block, however close to the index it sits.
+    """
+    if looks_like_our_index(message, suffix):
+        return "index"
+    document_id = sticker_document_id(message)
+    if document_id is not None and document_id == divider_id:
+        return None  # The separator, not the index's own sticker.
+    if document_id is not None or is_index_sticker(message):
+        return "sticker"
+    return None
+
+
+def find_divider_id(
+    messages: Sequence[Message], minimum: int = MIN_DIVIDER_REPEATS
+) -> int | None:
+    """Return the sticker a channel repeats as its post separator.
+
+    A sticker used once is decoration; one used over and over between posts is
+    the divider. Taking the most repeated one means it is always the sticker
+    that channel actually uses, with no id hardcoded here.
+    """
+    counts: dict[int, int] = {}
+    for message in messages:
+        document_id = sticker_document_id(message)
+        if document_id is not None:
+            counts[document_id] = counts.get(document_id, 0) + 1
+    if not counts:
+        return None
+    best = max(counts, key=lambda key: (counts[key], -key))
+    return best if counts[best] >= minimum else None
+
+
+def find_index_blocks(
+    kinds: Sequence[str | None], ours: Sequence[bool] | None = None
+) -> list[tuple[int, int]]:
+    """Return the inclusive spans that make up the source's index blocks.
+
+    A block starts at an index message and takes in the stickers that trail it.
+    It only reaches backwards for a sticker this tool posted itself, which is
+    how a channel indexed by the older scripts looks.
+
+    Reaching backwards for any sticker was wrong. Channels put their divider
+    immediately above the index, so the block swallowed it, lost a post, and
+    read as though it began with a sticker, which is what put the sticker above
+    the index in the clone instead of below it. A count of repeats cannot settle
+    it either, because a short sample may contain only one divider.
+    """
+    mine = list(ours or [False] * len(kinds))
+    blocks: list[tuple[int, int]] = []
+    position = 0
+    while position < len(kinds):
+        if kinds[position] != "index":
+            position += 1
+            continue
+        end = position
+        while end + 1 < len(kinds) and kinds[end + 1] in {"index", "sticker"}:
+            end += 1
+        start = position
+        while start - 1 >= 0 and kinds[start - 1] == "sticker" and mine[start - 1]:
+            start -= 1
+        blocks.append((start, end))
+        position = end + 1
+    return blocks
+
+
+def sticker_document_id(message: Message) -> int | None:
+    """Return the document id of a sticker post, or None."""
+    document = getattr(message, "document", None)
+    return getattr(document, "id", None) if is_sticker_message(message) else None
+
+
+def is_separator_post(post: SourcePost, separator_id: int | None) -> bool:
+    """Return whether a post is just the channel's divider sticker."""
+    if separator_id is None or len(post.messages) != 1:
+        return False
+    return sticker_document_id(post.messages[0]) == separator_id
+
+
+def is_sticker_only_post(post: SourcePost) -> bool:
+    """Return whether a post is a lone sticker carrying no text."""
+    if len(post.messages) != 1:
+        return False
+    message = post.messages[0]
+    text = (getattr(message, "message", None) or "").strip()
+    return not text and is_sticker_message(message)
+
+
+def separator_positions(
+    posts: Sequence[SourcePost],
+    separator_id: int | None,
+    every: int,
+    rng: random.Random | None = None,
+) -> set[int]:
+    """Choose the post ordinals that get a divider sticker after them.
+
+    The channel separates its posts with a thin sticker, but the plain text
+    posts at the end carry none. Those runs get dividers spread through them
+    rather than after every post: one per `every` posts, starting at a random
+    offset so the run does not look mechanical, which also guarantees two
+    dividers never end up next to each other.
+    """
+    chosen: set[int] = set()
+    if separator_id is None or every < 1:
+        return chosen
+    picker = rng or random.Random()
+
+    def spread(run: list[int]) -> None:
+        """Place dividers through one run of divider-less posts."""
+        if len(run) < every:
+            return
+        offset = picker.randrange(every)
+        for position in range(offset, len(run), every):
+            chosen.add(run[position])
+
+    run: list[int] = []
+    for post in posts:
+        if is_separator_post(post, separator_id):
+            # The source already divides here, so this run is finished.
+            spread(run)
+            run = []
+            continue
+        run.append(post.ordinal)
+    spread(run)
+    return chosen
+
+
+def dedupe_order(kinds: Iterable[str]) -> tuple[str, ...]:
+    """Collapse a block's kinds to each one's first appearance."""
+    seen: list[str] = []
+    for kind in kinds:
+        if kind not in seen:
+            seen.append(kind)
+    return tuple(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,12 +1187,23 @@ class SourcePost:
 
 @dataclass
 class SourceScan:
-    """The numbered posts of a source, and where its own index sat."""
+    """The numbered posts of a source, and how its own index block was laid out."""
 
     posts: list[SourcePost] = field(default_factory=list)
     # How many posts came before the source's own index, so the clone can put
     # its index back in the same place. None means the source had none.
     index_after: int | None = None
+    # The order the source arranged its index block in, "index" and "sticker"
+    # in the order they appear. None means the source had no index block.
+    index_order: tuple[str, ...] | None = None
+    # The source's own sticker, ready to resend. Its file reference is fresh,
+    # unlike the constant, whose reference Telegram expires over time.
+    sticker_media: object | None = None
+    # The thin sticker the channel uses to separate posts, and its document id.
+    # Taken from the source rather than hardcoded, so it is always the one that
+    # channel actually uses.
+    separator_media: object | None = None
+    separator_id: int | None = None
 
 
 def caption_filter_pattern(word: str) -> re.Pattern[str] | None:
@@ -1073,19 +1260,49 @@ async def collect_source_posts(
     A limit keeps the first few posts only, which is what .test uses; the posts
     it keeps are still numbered from 1, so a limited run is a faithful sample.
 
-    Where the source's own index sat is recorded rather than merely skipped, so
-    the clone can put its index back in the same place instead of always at the
-    end.
+    The source's own index block is not copied, since it points back at the
+    source, but its position and its internal arrangement are both recorded so
+    the clone can reproduce them.
     """
+    # Two passes. Deciding whether a sticker belongs to the index block needs
+    # to know what sits next to it, which a single forward pass cannot see.
+    raw: list[Message] = []
+    async for message in client.iter_messages(source.input_peer, reverse=True):
+        if getattr(message, "action", None) is not None:
+            continue  # Service messages ("channel created") are not content.
+        text = getattr(message, "message", None)
+        if not text and getattr(message, "media", None) is None:
+            continue
+        raw.append(message)
+
+    # The divider must be known before the index block is marked out, because
+    # the two sit next to each other and only the id tells them apart.
+    divider_id = find_divider_id(raw)
+    kinds = [index_block_kind(message, suffix, divider_id) for message in raw]
+    ours = [is_index_sticker(message) for message in raw]
+    blocks = find_index_blocks(kinds, ours)
+    in_block = [False] * len(raw)
+    for start, end in blocks:
+        for position in range(start, end + 1):
+            in_block[position] = True
+    first_block = blocks[0] if blocks else None
+
     scan = SourceScan()
+
+    scan.separator_id = divider_id
+    if divider_id is not None:
+        for message in raw:
+            if sticker_document_id(message) == divider_id:
+                with contextlib.suppress(Exception):
+                    scan.separator_media = clone_input_media(message)
+                break
+
     album: list[Message] = []
     album_id: int | None = None
 
     def keep(messages: list[Message]) -> None:
         """Number and keep a post."""
-        scan.posts.append(
-            SourcePost(ordinal=len(scan.posts) + 1, messages=messages)
-        )
+        scan.posts.append(SourcePost(ordinal=len(scan.posts) + 1, messages=messages))
 
     def flush() -> None:
         nonlocal album, album_id
@@ -1096,23 +1313,28 @@ async def collect_source_posts(
     def full() -> bool:
         return limit is not None and len(scan.posts) >= limit
 
-    async for message in client.iter_messages(source.input_peer, reverse=True):
-        if getattr(message, "action", None) is not None:
-            continue  # Service messages ("channel created") are not content.
-        text = getattr(message, "message", None)
-        if not text and getattr(message, "media", None) is None:
-            continue
-        if is_index_sticker(message) or looks_like_our_index(message, suffix):
-            # The source's own index points back at the source, so it is not
-            # copied; its position is remembered and a fresh one goes there.
+    for position, message in enumerate(raw):
+        if first_block is not None and position == first_block[0]:
             flush()
-            if scan.index_after is None:
-                scan.index_after = len(scan.posts)
-                LOG.debug(
-                    "Source %s: its index sits after post %s.",
-                    source.title,
-                    scan.index_after,
-                )
+            start, end = first_block
+            scan.index_after = len(scan.posts)
+            scan.index_order = dedupe_order(
+                kinds[at] for at in range(start, end + 1) if kinds[at]
+            )
+            for at in range(start, end + 1):
+                if kinds[at] == "sticker":
+                    # Resend the source's own sticker rather than the constant,
+                    # whose file reference Telegram expires.
+                    with contextlib.suppress(Exception):
+                        scan.sticker_media = clone_input_media(raw[at])
+                    break
+            LOG.debug(
+                "Source %s: index block after post %s, arranged %s.",
+                source.title,
+                scan.index_after,
+                " then ".join(scan.index_order),
+            )
+        if in_block[position]:
             continue
 
         grouped = getattr(message, "grouped_id", None)
@@ -1464,43 +1686,69 @@ class IndexPost:
         return len(self.message_ids)
 
 
+async def send_index_sticker(
+    client: TelegramClient, target: PeerRef, sticker: object | None
+) -> bool:
+    """Send the index sticker, preferring the one the source itself used."""
+    candidates = [
+        (sticker, "the source's own sticker"),
+        (INDEX_STICKER, "the built-in sticker"),
+    ]
+    for candidate, label in candidates:
+        if candidate is None:
+            continue
+        try:
+            await retry_on_wait(client.send_file, target.input_peer, candidate)
+            return True
+        except Exception as exc:  # A stale sticker must not cost us the index.
+            LOG.warning("Index sticker (%s) failed: %s", label, exc)
+    return False
+
+
 async def post_index(
     client: TelegramClient,
     target: PeerRef,
     entries: Sequence[IndexEntry],
     suffix: str,
+    order: Sequence[str] = DEFAULT_INDEX_ORDER,
+    sticker: object | None = None,
 ) -> IndexPost:
-    """Send the index sticker and the styled index where the cursor is now.
+    """Post the index block the way the source arranged it.
 
-    This is called at the position the source kept its own index, which may be
-    several posts before the end. The links of posts that come after it do not
-    exist yet, so those lines go out unlinked and refresh_index fills them in.
+    The order matters and is not ours to choose: a source that puts its index
+    above the sticker must be cloned that way round, which is what `order`
+    carries. This is called at the position the source kept its block, which
+    may be several posts before the end, so the links of posts that come after
+    it do not exist yet; those lines go out unlinked and refresh_index fills
+    them in once every post exists.
     """
     posted = IndexPost()
     if not entries:
         return posted
 
-    try:
-        await retry_on_wait(client.send_file, target.input_peer, INDEX_STICKER)
-    except Exception as exc:  # A stale sticker must not cost us the index.
-        LOG.warning("Index sticker skipped: %s", exc)
-
     posted.groups = group_entries(entries, suffix)
-    for group in posted.groups:
-        text, entities = render_entries(group, suffix)
-        try:
-            sent = await send_quote(client, target, text, entities)
-        except Exception as exc:
-            LOG.warning("Styled index failed (%s); retrying without premium emoji.", exc)
+    for kind in order:
+        if kind == "sticker":
+            await send_index_sticker(client, target, sticker)
+            await asyncio.sleep(SEND_DELAY)
+            continue
+        for group in posted.groups:
+            text, entities = render_entries(group, suffix)
             try:
-                sent = await send_quote(
-                    client, target, text, without_custom_emoji(entities)
+                sent = await send_quote(client, target, text, entities)
+            except Exception as exc:
+                LOG.warning(
+                    "Styled index failed (%s); retrying without premium emoji.", exc
                 )
-            except Exception as retry_exc:
-                LOG.error("Index message failed: %s", retry_exc)
-                continue
-        posted.message_ids.append(sent.id)
-        await asyncio.sleep(SEND_DELAY)
+                try:
+                    sent = await send_quote(
+                        client, target, text, without_custom_emoji(entities)
+                    )
+                except Exception as retry_exc:
+                    LOG.error("Index message failed: %s", retry_exc)
+                    continue
+            posted.message_ids.append(sent.id)
+            await asyncio.sleep(SEND_DELAY)
     return posted
 
 
@@ -1587,13 +1835,112 @@ class CloneReport:
     results: list[PostResult] = field(default_factory=list)
     indexed: int = 0  # Posts the index lists; the rest are cloned but unlisted.
     index_after: int = 0  # Posts published before the index.
+    index_order: tuple[str, ...] = DEFAULT_INDEX_ORDER
     photo_copied: bool = False
+    details: list[str] = field(default_factory=list)
+    dividers: int = 0  # Divider stickers added where the source had none.
 
 
 PHOTO_ACTIONS = (
     types.MessageActionChatEditPhoto,
     types.MessageActionChatDeletePhoto,
 )
+PIN_ACTIONS = (types.MessageActionPinMessage,)
+
+
+@dataclass
+class SourceDetails:
+    """The parts of a channel that are not posts but still make it itself."""
+
+    about: str = ""
+    pinned_id: int | None = None
+    protected: bool = False  # "Restrict saving content" is on.
+
+
+async def read_source_details(
+    client: TelegramClient, source: PeerRef
+) -> SourceDetails:
+    """Read the source's description, pinned post and content protection."""
+    if source.kind != "channel":
+        return SourceDetails()
+    full = await retry_on_wait(
+        client, functions.channels.GetFullChannelRequest(channel=source.input_channel)
+    )
+    chat = full.full_chat
+    protected = any(
+        getattr(entity, "noforwards", False)
+        for entity in getattr(full, "chats", None) or []
+        if getattr(entity, "id", None) == source.id
+    )
+    return SourceDetails(
+        about=getattr(chat, "about", "") or "",
+        pinned_id=getattr(chat, "pinned_msg_id", None),
+        protected=protected,
+    )
+
+
+async def apply_source_details(
+    client: TelegramClient,
+    target: PeerRef,
+    details: SourceDetails,
+    id_map: dict[int, int],
+) -> list[str]:
+    """Give the clone the source's description, pin and content protection.
+
+    Returns what was actually applied, for the report. Pinning is done here,
+    after the posts exist, and its service message is removed the same way the
+    profile photo's is.
+    """
+    applied: list[str] = []
+
+    if details.about:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.EditChatAboutRequest(
+                    peer=target.input_peer, about=details.about
+                ),
+            )
+            applied.append("description")
+        except Exception as exc:
+            LOG.warning("Could not copy the description: %s", exc)
+
+    if details.protected:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.ToggleNoForwardsRequest(
+                    peer=target.input_peer, enabled=True
+                ),
+            )
+            applied.append("content protection")
+        except Exception as exc:
+            LOG.warning("Could not enable content protection: %s", exc)
+
+    pinned = id_map.get(details.pinned_id) if details.pinned_id else None
+    if pinned is not None:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.UpdatePinnedMessageRequest(
+                    peer=target.input_peer, id=pinned, silent=True
+                ),
+            )
+            applied.append("pinned post")
+            leftover = await sweep_service_messages(client, target, PIN_ACTIONS)
+            if leftover:
+                with contextlib.suppress(Exception):
+                    await retry_on_wait(
+                        client.delete_messages, target.input_peer, leftover
+                    )
+        except Exception as exc:
+            LOG.warning("Could not pin the cloned post: %s", exc)
+    elif details.pinned_id:
+        LOG.info("The source's pinned post was not cloned, so nothing was pinned.")
+
+    if applied:
+        LOG.info("Copied %s.", ", ".join(applied))
+    return applied
 
 
 def service_message_ids(result: object, actions: tuple[type, ...]) -> list[int]:
@@ -1679,6 +2026,7 @@ async def clone_source(
     suffix: str,
     limit: int | None = None,
     caption_filter: str = "",
+    separator_every: int = 0,
 ) -> CloneReport:
     """Copy a source into a brand new channel and index it."""
     source = slot.source
@@ -1689,26 +2037,45 @@ async def clone_source(
         raise RuntimeError(f"{source.title} has no posts to clone")
     LOG.info("%s: %s post(s) to clone.", source.title, len(posts))
 
+    details = SourceDetails()
+    try:
+        details = await read_source_details(client, source)
+    except Exception as exc:
+        LOG.warning("Could not read %s's details: %s", source.title, exc)
+
     target = await create_clone_channel(client, slot.clone_title())
 
     # The source keeps its index after this many posts; None means at the end.
     index_after = len(posts) if scan.index_after is None else scan.index_after
-    if scan.index_after is not None and scan.index_after < len(posts):
+    index_order = scan.index_order or DEFAULT_INDEX_ORDER
+    if scan.index_after is not None:
         LOG.info(
-            "%s: the index goes after post %s, as in the source.",
+            "%s: the index goes after post %s, arranged %s, as in the source.",
             slot.name,
             index_after,
+            " then ".join(index_order),
+        )
+
+    dividers = separator_positions(posts, scan.separator_id, separator_every)
+    if dividers:
+        LOG.info(
+            "%s: adding %s divider(s) through the posts that carry none.",
+            slot.name,
+            len(dividers),
         )
 
     id_map: dict[int, int] = {}
     results: list[PostResult] = []
     posted_index = IndexPost()
+    divided = 0
 
     async def place_index() -> None:
         """Post the index here, with whatever links already exist."""
         nonlocal posted_index
         entries = build_index_entries(posts, results, target, caption_filter)
-        posted_index = await post_index(client, target, entries, suffix)
+        posted_index = await post_index(
+            client, target, entries, suffix, index_order, scan.sticker_media
+        )
 
     for post in posts:
         if len(results) == index_after:
@@ -1718,6 +2085,17 @@ async def clone_source(
         if done % 20 == 0 or done == len(posts):
             LOG.info("%s: cloned %s/%s post(s).", slot.name, done, len(posts))
         await asyncio.sleep(SEND_DELAY)
+        if post.ordinal in dividers:
+            # A divider is decoration, not a post: it takes no ordinal, so the
+            # numbering and the index are untouched by it.
+            try:
+                await retry_on_wait(
+                    client.send_file, target.input_peer, scan.separator_media
+                )
+                divided += 1
+            except Exception as exc:
+                LOG.warning("%s: divider after post %s failed: %s", slot.name, post.ordinal, exc)
+            await asyncio.sleep(SEND_DELAY)
     if len(results) == index_after:
         await place_index()  # The index belongs at the very end.
 
@@ -1734,13 +2112,19 @@ async def clone_source(
     if degraded:
         LOG.warning("%s: %s post(s) lost their premium emoji.", slot.name, degraded)
 
-    # The photo goes on last so its service message lands after every post,
-    # where it can be deleted without leaving a hole among the clones.
+    # The photo and the pin go on last so their service messages land after
+    # every post, where they can be deleted without leaving a hole among them.
     photo_copied = False
     try:
         photo_copied = await copy_profile_photo(client, source, target)
     except Exception as exc:
         LOG.warning("%s: could not copy the profile photo: %s", slot.name, exc)
+
+    applied: list[str] = []
+    try:
+        applied = await apply_source_details(client, target, details, id_map)
+    except Exception as exc:
+        LOG.warning("%s: could not copy the channel details: %s", slot.name, exc)
 
     # Now that every post exists, the index lines can point at them.
     entries = build_index_entries(posts, results, target, caption_filter)
@@ -1776,7 +2160,10 @@ async def clone_source(
         results=results,
         indexed=len(entries),
         index_after=index_after,
+        index_order=tuple(index_order),
         photo_copied=photo_copied,
+        details=applied,
+        dividers=divided,
     )
 
 
@@ -1814,10 +2201,13 @@ async def verify_clone_order(
     # The clone is read with no caption filter: whatever the filter let through
     # is already all that was published, and re-filtering would hide a fault.
     cloned = (await collect_source_posts(client, report.peer, suffix)).posts
+    # Divider stickers are decoration and the clone may carry more of them than
+    # the source did, so both sides are compared on their real posts only.
+    cloned = [post for post in cloned if not is_sticker_only_post(post)]
     expected = [
         post
         for post, result in zip(report.source_posts, report.results, strict=True)
-        if result.ok
+        if result.ok and not is_sticker_only_post(post)
     ]
     check = OrderCheck(expected=len(expected), found=len(cloned))
 
@@ -1993,7 +2383,11 @@ async def run_cycle(client: TelegramClient, state: State, suffix: str) -> int:
         for copy_number in range(1, state.clones_per_source + 1):
             try:
                 report = await clone_source(
-                    client, slot, suffix, caption_filter=state.caption_filter
+                    client,
+                    slot,
+                    suffix,
+                    caption_filter=state.caption_filter,
+                    separator_every=state.separator_every,
                 )
             except Exception as exc:
                 LOG.error("%s: clone %s failed: %s", slot.name, copy_number, exc)
@@ -2097,6 +2491,7 @@ COMMAND_HELP = (
     ".clones N                 clones to create per source each cycle\n"
     ".links N                  times each invite link is repeated\n"
     ".filter WORD | off        index only posts with WORD in the caption\n"
+    ".separator N | off        divider stickers, one per N undivided posts\n"
     ".start                    start rotating\n"
     ".stop                     stop rotating and wipe the live clones\n"
     ".rotate                   wipe and rebuild now\n"
@@ -2300,6 +2695,34 @@ async def command_filter(runtime: Runtime, event: object, args: list[str]) -> No
     await set_status(event, f"Index filter: {word}")
 
 
+async def command_separator(runtime: Runtime, event: object, args: list[str]) -> None:
+    """Set how densely divider stickers fill the runs that carry none."""
+    state = runtime.state
+    if not args:
+        current = state.separator_every or "off"
+        await set_status(event, f"Divider: one per {current} post(s)")
+        return
+    word = args[0].lower()
+    if word in {"off", "none", "-", "0"}:
+        state.separator_every = 0
+        state.save()
+        LOG.info("Dividers turned off.")
+        await set_status(event, "Divider: off")
+        return
+    try:
+        every = int(word)
+    except ValueError:
+        await set_status(event, "Usage: .separator N")
+        return
+    if every < 1:
+        await set_status(event, "Usage: .separator N")
+        return
+    state.separator_every = every
+    state.save()
+    LOG.info("Divider density set to one per %s post(s).", every)
+    await set_status(event, f"Divider: one per {every} post(s)")
+
+
 async def command_start(runtime: Runtime, event: object, args: list[str]) -> None:
     """Start the rotation loop."""
     state = runtime.state
@@ -2378,10 +2801,16 @@ async def run_slot_test(
         runtime.suffix,
         limit=posts,
         caption_filter=state.caption_filter,
+        separator_every=state.separator_every,
     )
     lines.append(f"source      {slot.source.title}, {report.total} post(s) sampled")
     lines.append(f"channel     created as {report.peer.title}")
     lines.append(f"photo       {'copied' if report.photo_copied else 'none to copy'}")
+    lines.append(
+        f"details     {', '.join(report.details) if report.details else 'none to copy'}"
+    )
+    if report.dividers:
+        lines.append(f"dividers    {report.dividers} added where the source had none")
 
     if report.gaps:
         ok = False
@@ -2409,6 +2838,7 @@ async def run_slot_test(
         lines.append(
             f"index       {report.index_messages} message(s) {placed}, {listed}"
         )
+        lines.append(f"arranged    {' then '.join(report.index_order)}, as in the source")
     elif report.indexed == 0:
         listed = (
             f"no caption has {state.caption_filter!r}"
@@ -2521,6 +2951,7 @@ async def command_status(runtime: Runtime, event: object, args: list[str]) -> No
         f"Clones per source: {state.clones_per_source}",
         f"Link lines per clone: {state.link_repeat}",
         f"Index filter: {state.caption_filter or 'off'}",
+        f"Divider: {f'one per {state.separator_every}' if state.separator_every else 'off'}",
         f"Cycle: {state.cycle}",
     ]
     if state.published_at:
@@ -2558,6 +2989,7 @@ COMMANDS: dict[str, Callable[[Runtime, object, list[str]], Awaitable[None]]] = {
     "clones": command_clones,
     "links": command_links,
     "filter": command_filter,
+    "separator": command_separator,
     "start": command_start,
     "stop": command_stop,
     "rotate": command_rotate,
@@ -2612,6 +3044,7 @@ async def main() -> None:
         state.clones_per_source = settings.clones_per_source
         state.link_repeat = settings.link_repeat
         state.caption_filter = settings.caption_filter
+        state.separator_every = settings.separator_every
         state.save()
         LOG.info(
             "First run: interval %s minutes, %s clone(s) per source, "

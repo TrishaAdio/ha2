@@ -937,14 +937,26 @@ def make_quote_messages(
     ]
 
 
-def render_link_messages(
-    links: Sequence[str], repeat: int, max_units: int = MAX_MESSAGE_UNITS
-) -> list[tuple[str, list[types.TypeMessageEntity]]]:
-    """Render invite links as repeated plain lines inside one blockquote.
+# Entities each link line costs: the marker, and bold plus the hyperlink on the
+# link text itself.
+ENTITIES_PER_LINK_LINE = 3
 
-    Each link gets `repeat` lines of its own, the first carrying the marker
-    emoji. The URLs are left as plain text: Telegram detects them itself, so
-    they stay visible and clickable without spending an entity per line.
+
+def render_link_messages(
+    links: Sequence[str],
+    repeat: int,
+    max_units: int = MAX_MESSAGE_UNITS,
+    max_entities: int = MAX_MESSAGE_ENTITIES,
+) -> list[tuple[str, list[types.TypeMessageEntity]]]:
+    """Render invite links as repeated bold marked lines inside one blockquote.
+
+    Every line carries the marker emoji, and the link text is bold. The first
+    line of a block keeps a space after the marker, as asked.
+
+    The link is an explicit hyperlink rather than plain text left for Telegram
+    to notice. Without a space the marker sits directly against the URL, and
+    auto-detection cannot be relied on across that boundary; an explicit
+    hyperlink is clickable whatever precedes it.
     """
     messages: list[tuple[str, list[types.TypeMessageEntity]]] = []
     text = ""
@@ -959,19 +971,39 @@ def render_link_messages(
         messages.append((body, [quote, *entities]))
         text, entities = "", []
 
+    marker_units = utf16_length(MARKER_EMOJI)
     for link in links:
-        block = f"{MARKER_EMOJI} {link}\n" + f"{link}\n" * max(0, repeat - 1)
+        lines = [
+            f"{MARKER_EMOJI}{' ' if position == 0 else ''}{link}\n"
+            for position in range(max(1, repeat))
+        ]
+        block = "".join(lines)
         # One link's lines are never split across two messages.
-        if text and utf16_length(text + block) > max_units:
+        if text and (
+            utf16_length(text + block) > max_units
+            or len(entities) + ENTITIES_PER_LINK_LINE * len(lines) + 1 > max_entities
+        ):
             flush()
-        entities.append(
-            types.MessageEntityCustomEmoji(
-                offset=utf16_length(text),
-                length=utf16_length(MARKER_EMOJI),
-                document_id=MARKER_EMOJI_ID,
+        for line in lines:
+            line_offset = utf16_length(text)
+            link_offset = line_offset + utf16_length(line) - utf16_length(f"{link}\n")
+            link_units = utf16_length(link)
+            entities.append(
+                types.MessageEntityCustomEmoji(
+                    offset=line_offset,
+                    length=marker_units,
+                    document_id=MARKER_EMOJI_ID,
+                )
             )
-        )
-        text += block
+            entities.append(
+                types.MessageEntityBold(offset=link_offset, length=link_units)
+            )
+            entities.append(
+                types.MessageEntityTextUrl(
+                    offset=link_offset, length=link_units, url=link
+                )
+            )
+            text += line
     flush()
     return messages
 

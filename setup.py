@@ -26,6 +26,8 @@ from pathlib import Path
 MIN_PYTHON = (3, 10)
 MIN_INTERVAL_MINUTES = 10
 DEFAULT_INTERVAL_MINUTES = 30
+DEFAULT_LINK_REPEAT = 5
+DEFAULT_CAPTION_FILTER = "Dm"
 
 ROOT = Path(__file__).resolve().parent
 VENV_DIR = ROOT / ".venv"
@@ -323,6 +325,21 @@ def collect_settings(existing: dict[str, str]) -> dict[str, str]:
     clones = ask_int(
         "Clones per source each cycle", existing.get("REDIRECT_CLONES", "1"), 1
     )
+    info("Each invite link is repeated this many times, one per line, in a quote.")
+    repeat = ask_int(
+        "Link lines per clone",
+        existing.get("REDIRECT_LINK_REPEAT", str(DEFAULT_LINK_REPEAT)),
+        1,
+    )
+
+    heading("what gets cloned")
+    info("Only media posts whose caption mentions this word are cloned.")
+    info("'-' clones every post instead.")
+    caption_filter = ask(
+        "Caption must mention", existing.get("REDIRECT_FILTER", DEFAULT_CAPTION_FILTER)
+    )
+    if caption_filter == "-":
+        caption_filter = ""
 
     current_suffix = existing.get("INDEX_SUFFIX", " | Demo")
     info("The index suffix is appended to every index title. '-' means none.")
@@ -342,6 +359,8 @@ def collect_settings(existing: dict[str, str]) -> dict[str, str]:
         "REDIRECT_SESSION": session,
         "REDIRECT_INTERVAL": interval,
         "REDIRECT_CLONES": clones,
+        "REDIRECT_LINK_REPEAT": repeat,
+        "REDIRECT_FILTER": caption_filter,
         "INDEX_SUFFIX": suffix,
         "REDIRECT_AUTOSTART": autostart,
     }

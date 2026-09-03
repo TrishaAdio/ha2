@@ -3,3 +3,9 @@
 *.session-journal
 __pycache__/
 *.py[cod]
+
+# setup.py and redirect.py artifacts
+.venv/
+redirect_state.json
+redirect_state.tmp
+*.log

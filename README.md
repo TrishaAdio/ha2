@@ -7,6 +7,7 @@ Five Telethon userbot scripts:
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
 - **`lol.py`** deletes posts across your chats: `.delete <text>` removes every post containing a text in groups you moderate, and `.delme` removes every photo you sent, with its caption, everywhere. See [lol.py](#lolpy-delete-posts-by-text).
 - **`iam.py`** copies one account's whole profile onto the signed-in account, for rebuilding your own identity after losing access to it. See [iam.py](#iampy-copy-a-profile-onto-this-account).
+- **`redirect.py`** keeps named source channels mirrored into throwaway channels that are rebuilt on a timer, dropping the fresh invite links into a chat you assign. See [redirect.py](#redirectpy-rotating-channel-cloner). Run [`setup.py`](#setuppy-installer) once first.
 
 # main.py: Chat Photo Copier
 
@@ -437,6 +438,105 @@ python iam.py
 
 This writes over the signed-in account's own profile, which is the point, but there is no undo. `.this dry` shows the whole plan first.
 
+# redirect.py: Rotating Channel Cloner
+
+Registers source channels under short names, clones each one into a brand new private channel, publishes the invite links in a chat you assign, and after a set number of minutes deletes every post, deletes the channel, and builds it all again with fresh links.
+
+## Setup and first run
+
+```bash
+python3 setup.py          # creates .venv, installs deps, asks for credentials
+source .venv/bin/activate
+python redirect.py
+```
+
+Then, from the same account, send these as ordinary messages:
+
+```text
+.setchannel OK            # in the channel you want cloned
+.assign OK                # in the channel where the links should appear
+.interval 30
+.test
+.start
+```
+
+`.setchannel` and `.assign` act on the chat you send them in. Either one also takes a link, invite or `@handle` as its last argument, so `.setchannel VIP @somechannel` works from anywhere.
+
+## Commands
+
+| Command | Effect |
+| --- | --- |
+| `.setchannel NAME [link]` | Register a source channel under `NAME` (also `.setsource`) |
+| `.assign NAME [link]` | Publish `NAME`'s links in this chat (`.assing` works too) |
+| `.unset NAME` | Forget a source |
+| `.unassign NAME` | Forget where `NAME`'s links go |
+| `.interval MINUTES` | How long a clone stays up; 10 is the floor |
+| `.clones N` | Clone channels per source per cycle, so links per cycle |
+| `.start` / `.stop` | Begin rotating / stop and wipe what is published |
+| `.rotate` | Wipe and rebuild immediately |
+| `.test [NAME] [POSTS]` | Rehearse a whole cycle on a few posts, then undo it |
+| `.status` | Configuration, live clones and time until the next rotation |
+| `.help` | The list above |
+
+## What one cycle does
+
+1. Creates a fresh private channel per registered source.
+2. Copies every post into it: text, media, albums, spoilers, replies, web previews and premium custom emoji are all preserved. Nothing is downloaded, so no "Forwarded from" header appears and the upload is instant.
+3. Posts the styled linked index at the end of the clone.
+4. Exports an invite link and publishes the links in the assigned chats, one link per line inside a single blockquote. Two registered sources sharing an assigned chat produce one post with two lines.
+5. Waits out the interval, then deletes every post, deletes the channels, removes the link post, and starts over.
+
+Everything worth keeping lives in `redirect_state.json`, so a restart resumes and a crash cleans up the channels the previous run left behind.
+
+## `.test` first
+
+`.test` runs the real pipeline at small scale and then removes all of it, which is the fastest way to confirm an account can actually do the job before committing to a rotation:
+
+```text
+Test: OK
+source      My Channel, 3 post(s) sampled
+channel     created as My Channel
+clone       3/3 post(s), no gaps
+order       3/3 in order
+index       1 message(s)
+invite      https://t.me/+AbCdEf...
+links       published in Drops
+cleanup     test channels and links removed
+Everything worked.
+```
+
+`order` is the interesting line: it re-reads the finished clone and checks that its Nth post really is the source's Nth post, by caption and album size. `.test OK 10` samples ten posts from one slot. Test channels are tracked separately from the rotation, so a failed test never disturbs a running cycle and its leftovers are cleaned up on the next start.
+
+## Post numbering, and why this is not `main.py`'s `.clone`
+
+`main.py`'s `.clone` loses the ordering. It drops posts silently — service messages, its own index, anything whose media cannot be resent, anything whose caption Telegram refuses — and never accounts for the hole, so the source's 3rd post lands where the 2nd should be and the index points at the wrong post from there on. Its index also covers media posts only, so a plain text post shifts every later line.
+
+`redirect.py` treats the post number as a real value:
+
+- Every source post is collected and numbered **before** anything is sent, so a later failure cannot renumber an earlier post.
+- A post Telegram refuses is retried without its premium emoji, then re-uploaded, then re-uploaded without premium emoji. A caption costs a post its emoji, not its place.
+- A post that still cannot be recreated is recorded as an explicit gap and logged. It never silently pulls the following posts up by one.
+- The index emits exactly one line per source post, in post order, so index line N is source post N even when the post is plain text or its caption yields no title. A gapped post keeps its line, without a link.
+- Album parts are sorted by message id, and replies are remapped only when Telegram returns as many messages as were sent, instead of zipping two lists of different lengths.
+- Index detection requires every line to be an index line, so a genuine post that happens to be a quote is not mistaken for an old index and deleted.
+
+## Notes
+
+- The interval floor is 10 minutes. Creating a channel, uploading a clone and exporting an invite already costs minutes, and Telegram starts answering channel creation with flood waits below that.
+- Premium custom emoji need a Premium account to *send*. Without one, posts and the index are published with the fallback emoji and the run reports how many were affected.
+- Clone channels are created by the signed-in account, which is what allows the script to delete them again.
+- Telegram limits how many channels an account can create per day. A short interval with several sources reaches that limit quickly; the log shows the flood wait when it does.
+
+# setup.py: Installer
+
+`setup.py` here is an interactive installer, not a packaging script. It creates `.venv`, installs `requirements.txt`, verifies the dependencies import, and writes the settings to `.env`:
+
+```bash
+python3 setup.py
+```
+
+Re-running it is safe: every prompt offers the current value, so pressing Enter keeps it. Only the keys it owns are touched, so the settings the other scripts read from the same `.env` survive, comments included. It refuses to run when invoked by `pip install .` or a setuptools command.
+
 # Security
 
-Never commit `.env` or Telethon `.session` files. Both are excluded by `.gitignore`.
+Never commit `.env` or Telethon `.session` files. Both are excluded by `.gitignore`, along with `.venv/`, `redirect_state.json` and `*.log`.

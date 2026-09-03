@@ -9,6 +9,8 @@ Five Telethon userbot scripts:
 - **`iam.py`** copies one account's whole profile onto the signed-in account, for rebuilding your own identity after losing access to it. See [iam.py](#iampy-copy-a-profile-onto-this-account).
 - **`redirect.py`** keeps named source channels mirrored into throwaway channels that are rebuilt on a timer, dropping the fresh invite links into a chat you assign. See [redirect.py](#redirectpy-rotating-channel-cloner). Run [`setup.py`](#setuppy-installer) once first.
 
+  Related: [what the index lists](#what-the-index-lists), [the link post](#the-link-post), [where the index goes](#where-the-index-goes).
+
 # main.py: Chat Photo Copier
 
 A Telethon userbot that copies every photo from a selected source chat to a selected destination chat. Broadcast channels, supergroups, forum groups, and legacy basic groups are all supported on both sides.
@@ -473,7 +475,7 @@ Then, from the same account, send these as ordinary messages:
 | `.interval MINUTES` | How long a clone stays up; 10 is the floor |
 | `.clones N` | Clone channels per source per cycle, so links per cycle |
 | `.links N` | Times each invite link is repeated in the link post (default 5) |
-| `.filter WORD` / `.filter off` | Clone only media posts with `WORD` in the caption (default `Dm`) |
+| `.filter WORD` / `.filter off` | Index only media posts with `WORD` in the caption (default `Dm`); everything is still cloned |
 | `.start` / `.stop` | Begin rotating / stop and wipe what is published |
 | `.rotate` | Wipe and rebuild immediately |
 | `.test [NAME] [POSTS]` | Rehearse a whole cycle on a few posts, then undo it |
@@ -483,17 +485,19 @@ Then, from the same account, send these as ordinary messages:
 ## What one cycle does
 
 1. Creates a fresh private channel per registered source.
-2. Copies the matching posts into it: text, media, albums, spoilers, replies, web previews and premium custom emoji are all preserved. Nothing is downloaded, so no "Forwarded from" header appears and the upload is instant.
+2. Copies every post into it: text, media, albums, spoilers, replies, web previews and premium custom emoji are all preserved. Nothing is downloaded, so no "Forwarded from" header appears and the upload is instant.
 3. Posts the styled linked index **where the source keeps its own index**, not always at the end.
 4. Copies the source's profile photo onto the clone, and deletes the "channel photo changed" service message Telegram adds.
 5. Exports an invite link and publishes the links in the assigned chats.
 6. Waits out the interval, then deletes every post, deletes the channels, removes the link post, and starts over.
 
-## Which posts get cloned
+## What the index lists
 
-By default only posts that carry media **and** mention `Dm` in their caption, because that is what the links are selling. A caption is matched on a word boundary, so `Dm`, `dm` and `DM` all count while `admin` does not, and an album is kept when any of its parts carries the word. `.filter off` clones everything instead, and `.filter <word>` uses a different word.
+**Every post is cloned** — media, plain text, and the text replies hanging off a media post. The filter never changes that.
 
-Filtered posts are never numbered, so the clone is numbered 1..N over the posts that survived.
+What it changes is the index: by default only posts that carry media **and** mention `Dm` in their caption get a line, because those are the ones the links are selling. Everything else is still copied into the clone, just not listed. A caption is matched on a word boundary, so `Dm`, `dm` and `DM` all count while `admin` does not, and an album is listed when any of its parts carries the word.
+
+`.filter off` lists every post instead, and `.filter <word>` uses a different word.
 
 ## The link post
 
@@ -523,12 +527,12 @@ Everything worth keeping lives in `redirect_state.json`, so a restart resumes an
 
 ```text
 Test: OK
-source      My Channel, 3 post(s) sampled, 12 without 'Dm' skipped
+source      My Channel, 3 post(s) sampled
 channel     created as My Channel
 photo       copied
 clone       3/3 post(s), no gaps
 order       3/3 in order
-index       1 message(s) after post 2, as in the source
+index       1 message(s) after post 2, as in the source, 2/3 post(s) listed (caption has 'Dm')
 invite      https://t.me/+AbCdEf...
 links       published in Drops, repeated 5x
 cleanup     test channels and links removed

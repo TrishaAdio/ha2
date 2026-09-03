@@ -306,12 +306,15 @@ def read_settings() -> Settings:
 # ---------------------------------------------------------------------------
 # peers
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
+@dataclass
 class PeerRef:
     """A chat stored well enough to be used again after a restart.
 
     Telethon can usually resolve a bare id from its session cache, but a cache
     that was rebuilt loses it, so the access hash travels with the reference.
+
+    Not frozen on purpose: an access hash can arrive missing or go stale, and
+    ensure_peer repairs it in place so the stored copy heals itself.
     """
 
     kind: str  # "channel" or "chat"
@@ -325,6 +328,11 @@ class PeerRef:
         """Describe a Telethon entity as a storable reference."""
         title = utils.get_display_name(entity) or "Untitled"
         if isinstance(entity, types.Channel):
+            if not entity.access_hash:
+                # Telegram hands out "min" entities with no access hash. Stored
+                # as 0 it produces InputPeerChannel(id, 0), which Telegram
+                # answers with CHANNEL_PRIVATE even for the channel's owner.
+                LOG.debug("%s arrived without an access hash.", title)
             return cls(
                 kind="channel",
                 id=entity.id,
@@ -378,6 +386,85 @@ class PeerRef:
             title=data.get("title") or "Untitled",
             username=data.get("username") or None,
         )
+
+
+ACCESS_ERRORS = (
+    errors.ChannelPrivateError,
+    errors.ChannelInvalidError,
+    errors.PeerIdInvalidError,
+)
+
+
+async def peer_readable(client: TelegramClient, peer: types.TypeInputPeer) -> bool:
+    """Return whether Telegram will let us read this peer's history."""
+    try:
+        await retry_on_wait(client.get_messages, peer, limit=1)
+        return True
+    except ACCESS_ERRORS:
+        return False
+    except ValueError:
+        return False
+
+
+def adopt_entity(ref: PeerRef, entity: object) -> PeerRef:
+    """Refresh a reference from a freshly fetched entity."""
+    ref.access_hash = getattr(entity, "access_hash", 0) or 0
+    ref.username = entity_username(entity) or ref.username
+    ref.title = utils.get_display_name(entity) or ref.title
+    return ref
+
+
+async def ensure_peer(client: TelegramClient, ref: PeerRef) -> PeerRef:
+    """Make sure a stored reference still resolves, repairing it in place.
+
+    An access hash can arrive missing, or go stale after the session is rebuilt,
+    and Telegram reports both as CHANNEL_PRIVATE: "the channel is private and
+    you lack permission", which is misleading when you own the channel. So the
+    reference is checked and, if it does not work, resolved again.
+    """
+    if ref.kind != "channel":
+        return ref
+
+    if ref.access_hash and await peer_readable(client, ref.input_peer):
+        return ref
+
+    # A username always resolves and brings a fresh access hash with it.
+    if ref.username:
+        try:
+            entity = await retry_on_wait(client.get_entity, ref.username)
+            if isinstance(entity, types.Channel) and entity.id == ref.id:
+                LOG.info("Re-resolved %s by its username.", ref.title)
+                return adopt_entity(ref, entity)
+        except Exception as exc:
+            LOG.debug("Could not resolve %s by username: %s", ref.title, exc)
+
+    # Whatever Telethon still has cached for this id.
+    try:
+        cached = await client.get_input_entity(types.PeerChannel(ref.id))
+        hash_ = getattr(cached, "access_hash", 0) or 0
+        if hash_ and hash_ != ref.access_hash and await peer_readable(client, cached):
+            LOG.info("Re-resolved %s from the session cache.", ref.title)
+            ref.access_hash = hash_
+            return ref
+    except Exception as exc:
+        LOG.debug("Nothing cached for %s: %s", ref.title, exc)
+
+    # The dialog list rewrites the session cache with fresh hashes, which is
+    # what recovers a private channel the account is a member of.
+    LOG.info("Looking %s up in the dialog list...", ref.title)
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            if isinstance(entity, types.Channel) and entity.id == ref.id:
+                LOG.info("Re-resolved %s from the dialog list.", ref.title)
+                return adopt_entity(ref, entity)
+    except Exception as exc:
+        LOG.debug("Could not walk the dialog list: %s", exc)
+
+    raise RuntimeError(
+        f"{ref.title} could not be opened. If the account is still a member, "
+        f"send .setchannel again inside that channel to re-register it"
+    )
 
 
 def entity_username(entity: object) -> str | None:
@@ -937,14 +1024,26 @@ def make_quote_messages(
     ]
 
 
-def render_link_messages(
-    links: Sequence[str], repeat: int, max_units: int = MAX_MESSAGE_UNITS
-) -> list[tuple[str, list[types.TypeMessageEntity]]]:
-    """Render invite links as repeated plain lines inside one blockquote.
+# Entities each link line costs: the marker, and bold plus the hyperlink on the
+# link text itself.
+ENTITIES_PER_LINK_LINE = 3
 
-    Each link gets `repeat` lines of its own, the first carrying the marker
-    emoji. The URLs are left as plain text: Telegram detects them itself, so
-    they stay visible and clickable without spending an entity per line.
+
+def render_link_messages(
+    links: Sequence[str],
+    repeat: int,
+    max_units: int = MAX_MESSAGE_UNITS,
+    max_entities: int = MAX_MESSAGE_ENTITIES,
+) -> list[tuple[str, list[types.TypeMessageEntity]]]:
+    """Render invite links as repeated bold marked lines inside one blockquote.
+
+    Every line carries the marker emoji, and the link text is bold. The first
+    line of a block keeps a space after the marker, as asked.
+
+    The link is an explicit hyperlink rather than plain text left for Telegram
+    to notice. Without a space the marker sits directly against the URL, and
+    auto-detection cannot be relied on across that boundary; an explicit
+    hyperlink is clickable whatever precedes it.
     """
     messages: list[tuple[str, list[types.TypeMessageEntity]]] = []
     text = ""
@@ -959,19 +1058,39 @@ def render_link_messages(
         messages.append((body, [quote, *entities]))
         text, entities = "", []
 
+    marker_units = utf16_length(MARKER_EMOJI)
     for link in links:
-        block = f"{MARKER_EMOJI} {link}\n" + f"{link}\n" * max(0, repeat - 1)
+        lines = [
+            f"{MARKER_EMOJI}{' ' if position == 0 else ''}{link}\n"
+            for position in range(max(1, repeat))
+        ]
+        block = "".join(lines)
         # One link's lines are never split across two messages.
-        if text and utf16_length(text + block) > max_units:
+        if text and (
+            utf16_length(text + block) > max_units
+            or len(entities) + ENTITIES_PER_LINK_LINE * len(lines) + 1 > max_entities
+        ):
             flush()
-        entities.append(
-            types.MessageEntityCustomEmoji(
-                offset=utf16_length(text),
-                length=utf16_length(MARKER_EMOJI),
-                document_id=MARKER_EMOJI_ID,
+        for line in lines:
+            line_offset = utf16_length(text)
+            link_offset = line_offset + utf16_length(line) - utf16_length(f"{link}\n")
+            link_units = utf16_length(link)
+            entities.append(
+                types.MessageEntityCustomEmoji(
+                    offset=line_offset,
+                    length=marker_units,
+                    document_id=MARKER_EMOJI_ID,
+                )
             )
-        )
-        text += block
+            entities.append(
+                types.MessageEntityBold(offset=link_offset, length=link_units)
+            )
+            entities.append(
+                types.MessageEntityTextUrl(
+                    offset=link_offset, length=link_units, url=link
+                )
+            )
+            text += line
     flush()
     return messages
 
@@ -2031,6 +2150,9 @@ async def clone_source(
     """Copy a source into a brand new channel and index it."""
     source = slot.source
     LOG.info("Reading %s...", source.title)
+    # Check the stored reference before reading, so a missing or stale access
+    # hash is repaired instead of surfacing as "the channel is private".
+    await ensure_peer(client, source)
     scan = await collect_source_posts(client, source, suffix, limit)
     posts = scan.posts
     if not posts:
@@ -2261,6 +2383,10 @@ async def delete_all_posts(client: TelegramClient, peer: PeerRef) -> int:
 
 async def destroy_clone(client: TelegramClient, clone: LiveClone) -> None:
     """Empty a clone channel and then delete the channel itself."""
+    # A clone left over from a previous run may need re-resolving before it can
+    # be cleaned up; a failure here must not strand the channel.
+    with contextlib.suppress(Exception):
+        await ensure_peer(client, clone.peer)
     deleted = await delete_all_posts(client, clone.peer)
     LOG.info("%s: deleted %s post(s) from %r.", clone.slot, deleted, clone.peer.title)
     try:
@@ -2331,6 +2457,11 @@ async def publish_links(
 
     posts: list[LinkPost] = []
     for dest, members in grouped.values():
+        try:
+            await ensure_peer(client, dest)
+        except RuntimeError as exc:
+            LOG.error("Cannot publish in %r: %s", dest.title, exc)
+            continue
         links = [clone.link for clone in members]
         message_ids: list[int] = []
         for text, entities in render_link_messages(links, state.link_repeat):
@@ -2522,7 +2653,13 @@ async def target_from_args(
         entity = await event.get_chat()
     if not is_supported_chat(entity):
         raise RuntimeError("that chat is not a channel or group")
-    return PeerRef.of(entity), words
+
+    ref = PeerRef.of(entity)
+    # Prove the reference works now, while there is someone to tell, rather
+    # than letting it fail hours later in the middle of a rotation. ensure_peer
+    # checks before it repairs, so calling it here costs one read.
+    await ensure_peer(client, ref)
+    return ref, words
 
 
 def validate_slot_name(name: str) -> str:

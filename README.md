@@ -472,6 +472,8 @@ Then, from the same account, send these as ordinary messages:
 | `.unassign NAME` | Forget where `NAME`'s links go |
 | `.interval MINUTES` | How long a clone stays up; 10 is the floor |
 | `.clones N` | Clone channels per source per cycle, so links per cycle |
+| `.links N` | Times each invite link is repeated in the link post (default 5) |
+| `.filter WORD` / `.filter off` | Clone only media posts with `WORD` in the caption (default `Dm`) |
 | `.start` / `.stop` | Begin rotating / stop and wipe what is published |
 | `.rotate` | Wipe and rebuild immediately |
 | `.test [NAME] [POSTS]` | Rehearse a whole cycle on a few posts, then undo it |
@@ -481,10 +483,37 @@ Then, from the same account, send these as ordinary messages:
 ## What one cycle does
 
 1. Creates a fresh private channel per registered source.
-2. Copies every post into it: text, media, albums, spoilers, replies, web previews and premium custom emoji are all preserved. Nothing is downloaded, so no "Forwarded from" header appears and the upload is instant.
-3. Posts the styled linked index at the end of the clone.
-4. Exports an invite link and publishes the links in the assigned chats, one link per line inside a single blockquote. Two registered sources sharing an assigned chat produce one post with two lines.
-5. Waits out the interval, then deletes every post, deletes the channels, removes the link post, and starts over.
+2. Copies the matching posts into it: text, media, albums, spoilers, replies, web previews and premium custom emoji are all preserved. Nothing is downloaded, so no "Forwarded from" header appears and the upload is instant.
+3. Posts the styled linked index **where the source keeps its own index**, not always at the end.
+4. Copies the source's profile photo onto the clone, and deletes the "channel photo changed" service message Telegram adds.
+5. Exports an invite link and publishes the links in the assigned chats.
+6. Waits out the interval, then deletes every post, deletes the channels, removes the link post, and starts over.
+
+## Which posts get cloned
+
+By default only posts that carry media **and** mention `Dm` in their caption, because that is what the links are selling. A caption is matched on a word boundary, so `Dm`, `dm` and `DM` all count while `admin` does not, and an album is kept when any of its parts carries the word. `.filter off` clones everything instead, and `.filter <word>` uses a different word.
+
+Filtered posts are never numbered, so the clone is numbered 1..N over the posts that survived.
+
+## The link post
+
+Each clone's invite link is repeated `.links N` times, one per line, all inside a single blockquote, with the marker emoji on the first line:
+
+```text
+🟢 https://t.me/+1sj8IghHGBoxNTA1
+https://t.me/+1sj8IghHGBoxNTA1
+https://t.me/+1sj8IghHGBoxNTA1
+https://t.me/+1sj8IghHGBoxNTA1
+https://t.me/+1sj8IghHGBoxNTA1
+```
+
+The URLs are plain text, so Telegram links them itself and they stay readable. Two registered sources sharing an assigned chat produce one post holding both blocks.
+
+## Where the index goes
+
+The source's own index is not copied, because it links back to the source. Its **position** is copied: if the source keeps its index three posts from the end, the clone posts its index in the same place, then keeps going with the remaining posts.
+
+That needs the index to exist before the posts it links to, so the lines for later posts go out unlinked and are filled in by editing once every post exists. The message layout is measured as though every line were already linked, so the groups computed up front still fit afterwards and no index message has to move. If the source has no index of its own, the clone's goes at the end.
 
 Everything worth keeping lives in `redirect_state.json`, so a restart resumes and a crash cleans up the channels the previous run left behind.
 
@@ -494,13 +523,14 @@ Everything worth keeping lives in `redirect_state.json`, so a restart resumes an
 
 ```text
 Test: OK
-source      My Channel, 3 post(s) sampled
+source      My Channel, 3 post(s) sampled, 12 without 'Dm' skipped
 channel     created as My Channel
+photo       copied
 clone       3/3 post(s), no gaps
 order       3/3 in order
-index       1 message(s)
+index       1 message(s) after post 2, as in the source
 invite      https://t.me/+AbCdEf...
-links       published in Drops
+links       published in Drops, repeated 5x
 cleanup     test channels and links removed
 Everything worked.
 ```
@@ -525,6 +555,7 @@ Everything worked.
 - The interval floor is 10 minutes. Creating a channel, uploading a clone and exporting an invite already costs minutes, and Telegram starts answering channel creation with flood waits below that.
 - Premium custom emoji need a Premium account to *send*. Without one, posts and the index are published with the fallback emoji and the run reports how many were affected.
 - Clone channels are created by the signed-in account, which is what allows the script to delete them again.
+- The profile photo is copied as a still image. An animated channel photo becomes its cover frame.
 - Telegram limits how many channels an account can create per day. A short interval with several sources reaches that limit quickly; the log shows the flood wait when it does.
 
 # setup.py: Installer

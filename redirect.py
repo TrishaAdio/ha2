@@ -102,8 +102,15 @@ MIN_INTERVAL_MINUTES = 10
 DEFAULT_INTERVAL_MINUTES = 30
 
 SEND_DELAY = 0.6
+EDIT_DELAY = 0.4
 DELETE_CHUNK = 100
 DEFAULT_TEST_POSTS = 3
+
+# How many times the invite link is repeated in the link post, one per line.
+DEFAULT_LINK_REPEAT = 5
+MAX_LINK_REPEAT = 50
+# Only posts whose caption mentions this word are cloned. Empty means all.
+DEFAULT_CAPTION_FILTER = "Dm"
 TICK_SECONDS = 5.0
 SLOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
@@ -205,6 +212,8 @@ class Settings:
     # the next restart.
     interval_minutes: int
     clones_per_source: int
+    link_repeat: int
+    caption_filter: str
 
 
 def env_text(name: str, default: str = "") -> str:
@@ -266,6 +275,15 @@ def read_settings() -> Settings:
             "REDIRECT_INTERVAL", DEFAULT_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES
         ),
         clones_per_source=env_int("REDIRECT_CLONES", 1, 1),
+        link_repeat=min(
+            MAX_LINK_REPEAT, env_int("REDIRECT_LINK_REPEAT", DEFAULT_LINK_REPEAT, 1)
+        ),
+        # An unset variable takes the default; an empty one means no filter.
+        caption_filter=(
+            DEFAULT_CAPTION_FILTER
+            if os.getenv("REDIRECT_FILTER") is None
+            else env_text("REDIRECT_FILTER")
+        ),
     )
 
 
@@ -536,6 +554,8 @@ class State:
 
     interval_minutes: int = DEFAULT_INTERVAL_MINUTES
     clones_per_source: int = 1
+    link_repeat: int = DEFAULT_LINK_REPEAT
+    caption_filter: str = DEFAULT_CAPTION_FILTER
     running: bool = False
     cycle: int = 0
     published_at: float = 0.0
@@ -562,6 +582,8 @@ class State:
         payload = {
             "interval_minutes": self.interval_minutes,
             "clones_per_source": self.clones_per_source,
+            "link_repeat": self.link_repeat,
+            "caption_filter": self.caption_filter,
             "running": self.running,
             "cycle": self.cycle,
             "published_at": self.published_at,
@@ -592,6 +614,14 @@ class State:
             int(payload.get("interval_minutes") or DEFAULT_INTERVAL_MINUTES),
         )
         state.clones_per_source = max(1, int(payload.get("clones_per_source") or 1))
+        state.link_repeat = min(
+            MAX_LINK_REPEAT, max(1, int(payload.get("link_repeat") or DEFAULT_LINK_REPEAT))
+        )
+        # A stored empty string is a real choice: it means clone everything.
+        stored_filter = payload.get("caption_filter")
+        state.caption_filter = (
+            DEFAULT_CAPTION_FILTER if stored_filter is None else str(stored_filter)
+        )
         state.running = bool(payload.get("running"))
         state.cycle = int(payload.get("cycle") or 0)
         state.published_at = float(payload.get("published_at") or 0.0)
@@ -825,28 +855,100 @@ class IndexEntry:
     url: str | None
 
 
+# A stand-in used only while measuring, so grouping assumes the widest case of
+# three entities per line and stays valid once the real links are known.
+ASSUMED_URL = "https://t.me/c/0000000000/0"
+
+
+def group_entries(
+    entries: Iterable[IndexEntry],
+    suffix: str = "",
+    max_units: int = MAX_MESSAGE_UNITS,
+    max_entities: int = MAX_MESSAGE_ENTITIES,
+) -> list[list[IndexEntry]]:
+    """Decide which entries share a message, without rendering them.
+
+    Grouping depends only on the titles, because a link lives in an entity and
+    not in the text. Measuring every line as though it were linked means the
+    layout computed before the links are known still fits afterwards, which is
+    what lets the index be posted in the middle of the clone and filled in once
+    the posts after it exist.
+    """
+    groups: list[list[IndexEntry]] = []
+    current: list[IndexEntry] = []
+    block = QuoteLines()
+    for entry in entries:
+        label = f"{entry.title}{suffix}"
+        if block.would_overflow(label, ASSUMED_URL, max_units, max_entities):
+            groups.append(current)
+            current = []
+            block = QuoteLines()
+        block.add(label, ASSUMED_URL)
+        current.append(entry)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def render_entries(
+    entries: Sequence[IndexEntry], suffix: str = ""
+) -> tuple[str, list[types.TypeMessageEntity]]:
+    """Render one group of entries into a blockquoted message."""
+    block = QuoteLines()
+    for entry in entries:
+        block.add(f"{entry.title}{suffix}", entry.url)
+    return block.build()
+
+
 def make_quote_messages(
     entries: Iterable[IndexEntry],
     suffix: str = "",
     max_units: int = MAX_MESSAGE_UNITS,
     max_entities: int = MAX_MESSAGE_ENTITIES,
 ) -> list[tuple[str, list[types.TypeMessageEntity]]]:
-    """Split entries into as few blockquoted messages as Telegram allows.
+    """Split entries into as few blockquoted messages as Telegram allows."""
+    return [
+        render_entries(group, suffix)
+        for group in group_entries(entries, suffix, max_units, max_entities)
+    ]
 
-    Entries are consumed in the order given and never reordered, so the caller
-    controls the numbering; a new message starts only when the next line would
-    break the character or entity limit.
+
+def render_link_messages(
+    links: Sequence[str], repeat: int, max_units: int = MAX_MESSAGE_UNITS
+) -> list[tuple[str, list[types.TypeMessageEntity]]]:
+    """Render invite links as repeated plain lines inside one blockquote.
+
+    Each link gets `repeat` lines of its own, the first carrying the marker
+    emoji. The URLs are left as plain text: Telegram detects them itself, so
+    they stay visible and clickable without spending an entity per line.
     """
     messages: list[tuple[str, list[types.TypeMessageEntity]]] = []
-    block = QuoteLines()
-    for entry in entries:
-        label = f"{entry.title}{suffix}"
-        if block.would_overflow(label, entry.url, max_units, max_entities):
-            messages.append(block.build())
-            block = QuoteLines()
-        block.add(label, entry.url)
-    if block.lines:
-        messages.append(block.build())
+    text = ""
+    entities: list[types.TypeMessageEntity] = []
+
+    def flush() -> None:
+        nonlocal text, entities
+        if not text:
+            return
+        body = text.rstrip("\n")
+        quote = types.MessageEntityBlockquote(offset=0, length=utf16_length(body))
+        messages.append((body, [quote, *entities]))
+        text, entities = "", []
+
+    for link in links:
+        block = f"{MARKER_EMOJI} {link}\n" + f"{link}\n" * max(0, repeat - 1)
+        # One link's lines are never split across two messages.
+        if text and utf16_length(text + block) > max_units:
+            flush()
+        entities.append(
+            types.MessageEntityCustomEmoji(
+                offset=utf16_length(text),
+                length=utf16_length(MARKER_EMOJI),
+                document_id=MARKER_EMOJI_ID,
+            )
+        )
+        text += block
+    flush()
     return messages
 
 
@@ -907,9 +1009,58 @@ class SourcePost:
         return ", ".join(str(message.id) for message in self.messages)
 
 
+@dataclass
+class SourceScan:
+    """The numbered posts of a source, and where its own index sat."""
+
+    posts: list[SourcePost] = field(default_factory=list)
+    # How many kept posts came before the source's own index, so the clone can
+    # put its index back in the same place. None means the source had none.
+    index_after: int | None = None
+    skipped: int = 0  # Posts the caption filter rejected.
+
+
+def caption_filter_pattern(word: str) -> re.Pattern[str] | None:
+    """Compile a caption filter, or None when everything should be cloned."""
+    word = word.strip()
+    if not word:
+        return None
+    # A word boundary keeps "Dm" from matching inside "admin".
+    return re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
+
+
+def has_real_media(message: Message) -> bool:
+    """Return whether a message carries media, ignoring link previews."""
+    media = getattr(message, "media", None)
+    return media is not None and not isinstance(media, types.MessageMediaWebPage)
+
+
+def matches_caption_filter(
+    messages: Sequence[Message], pattern: re.Pattern[str] | None
+) -> bool:
+    """Return whether a post is media with the filter word in its caption.
+
+    Both halves matter: a post with no media is not what the filter is for, and
+    a caption is checked across every part of an album because Telegram stores
+    it on whichever part the sender typed it on.
+    """
+    if pattern is None:
+        return True
+    if not any(has_real_media(message) for message in messages):
+        return False
+    return any(
+        pattern.search(getattr(message, "message", None) or "")
+        for message in messages
+    )
+
+
 async def collect_source_posts(
-    client: TelegramClient, source: PeerRef, suffix: str, limit: int | None = None
-) -> list[SourcePost]:
+    client: TelegramClient,
+    source: PeerRef,
+    suffix: str,
+    limit: int | None = None,
+    caption_filter: str = "",
+) -> SourceScan:
     """Read every content post of a source, oldest first, and number them.
 
     Numbering happens here, in one pass, before a single message is sent. That
@@ -918,19 +1069,33 @@ async def collect_source_posts(
 
     A limit keeps the first few posts only, which is what .test uses; the posts
     it keeps are still numbered from 1, so a limited run is a faithful sample.
+
+    Where the source's own index sat is recorded rather than merely skipped, so
+    the clone can put its index back in the same place instead of always at the
+    end.
     """
-    posts: list[SourcePost] = []
+    scan = SourceScan()
+    pattern = caption_filter_pattern(caption_filter)
     album: list[Message] = []
     album_id: int | None = None
+
+    def keep(messages: list[Message]) -> None:
+        """Number and keep a post, unless the caption filter rejects it."""
+        if not matches_caption_filter(messages, pattern):
+            scan.skipped += 1
+            return
+        scan.posts.append(
+            SourcePost(ordinal=len(scan.posts) + 1, messages=messages)
+        )
 
     def flush() -> None:
         nonlocal album, album_id
         if album:
-            posts.append(SourcePost(ordinal=len(posts) + 1, messages=album))
+            keep(album)
         album, album_id = [], None
 
     def full() -> bool:
-        return limit is not None and len(posts) >= limit
+        return limit is not None and len(scan.posts) >= limit
 
     async for message in client.iter_messages(source.input_peer, reverse=True):
         if getattr(message, "action", None) is not None:
@@ -939,29 +1104,42 @@ async def collect_source_posts(
         if not text and getattr(message, "media", None) is None:
             continue
         if is_index_sticker(message) or looks_like_our_index(message, suffix):
-            # The source's own index points back at the source, and a fresh one
-            # is posted at the end, so copying it would leave two.
-            LOG.debug("Source %s: skipping old index message %s.", source.title, message.id)
+            # The source's own index points back at the source, so it is not
+            # copied; its position is remembered and a fresh one goes there.
+            flush()
+            if scan.index_after is None:
+                scan.index_after = len(scan.posts)
+                LOG.debug(
+                    "Source %s: its index sits after post %s.",
+                    source.title,
+                    scan.index_after,
+                )
             continue
 
         grouped = getattr(message, "grouped_id", None)
         if grouped is None:
             flush()
             if full():
-                return posts
-            posts.append(SourcePost(ordinal=len(posts) + 1, messages=[message]))
+                break
+            keep([message])
             if full():
-                return posts
+                break
             continue
         if album and grouped != album_id:
             flush()
             if full():
-                return posts
+                break
         album_id = grouped
         album.append(message)
+    else:
+        flush()
 
-    flush()
-    return posts[:limit] if limit is not None else posts
+    if limit is not None:
+        del scan.posts[limit:]
+    # An index recorded beyond the posts that survived is simply the end.
+    if scan.index_after is not None and scan.index_after > len(scan.posts):
+        scan.index_after = len(scan.posts)
+    return scan
 
 
 # ---------------------------------------------------------------------------
@@ -1267,35 +1445,108 @@ def build_index_entries(
     return entries
 
 
+@dataclass
+class IndexPost:
+    """The index messages already in the clone, and what belongs in them."""
+
+    groups: list[list[IndexEntry]] = field(default_factory=list)
+    message_ids: list[int] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        """Return how many index messages were posted."""
+        return len(self.message_ids)
+
+
 async def post_index(
     client: TelegramClient,
     target: PeerRef,
     entries: Sequence[IndexEntry],
     suffix: str,
-) -> int:
-    """Send the index sticker and the styled index at the end of a clone."""
+) -> IndexPost:
+    """Send the index sticker and the styled index where the cursor is now.
+
+    This is called at the position the source kept its own index, which may be
+    several posts before the end. The links of posts that come after it do not
+    exist yet, so those lines go out unlinked and refresh_index fills them in.
+    """
+    posted = IndexPost()
     if not entries:
-        return 0
+        return posted
 
     try:
         await retry_on_wait(client.send_file, target.input_peer, INDEX_STICKER)
     except Exception as exc:  # A stale sticker must not cost us the index.
         LOG.warning("Index sticker skipped: %s", exc)
 
-    posted = 0
-    for text, entities in make_quote_messages(entries, suffix):
+    posted.groups = group_entries(entries, suffix)
+    for group in posted.groups:
+        text, entities = render_entries(group, suffix)
         try:
-            await send_quote(client, target, text, entities)
+            sent = await send_quote(client, target, text, entities)
         except Exception as exc:
             LOG.warning("Styled index failed (%s); retrying without premium emoji.", exc)
             try:
-                await send_quote(client, target, text, without_custom_emoji(entities))
+                sent = await send_quote(
+                    client, target, text, without_custom_emoji(entities)
+                )
             except Exception as retry_exc:
                 LOG.error("Index message failed: %s", retry_exc)
                 continue
-        posted += 1
+        posted.message_ids.append(sent.id)
         await asyncio.sleep(SEND_DELAY)
     return posted
+
+
+async def refresh_index(
+    client: TelegramClient,
+    target: PeerRef,
+    posted: IndexPost,
+    entries: Sequence[IndexEntry],
+    suffix: str,
+) -> int:
+    """Edit the posted index so every line links to its finished post.
+
+    The grouping was measured as though every line were linked, so the groups
+    computed now match the ones already sent and each message keeps its place.
+    """
+    if not posted.message_ids:
+        return 0
+    by_ordinal = {entry.ordinal: entry for entry in entries}
+    updated = 0
+    for message_id, group in zip(posted.message_ids, posted.groups, strict=False):
+        final = [by_ordinal.get(entry.ordinal, entry) for entry in group]
+        if final == group:
+            continue  # Nothing in this message changed.
+        text, entities = render_entries(final, suffix)
+        try:
+            await retry_on_wait(
+                client.edit_message,
+                target.input_peer,
+                message_id,
+                text,
+                formatting_entities=list(entities),
+                link_preview=False,
+            )
+            updated += 1
+        except errors.MessageNotModifiedError:
+            pass
+        except Exception as exc:
+            LOG.warning("Could not refresh index message %s: %s", message_id, exc)
+            try:
+                await retry_on_wait(
+                    client.edit_message,
+                    target.input_peer,
+                    message_id,
+                    text,
+                    formatting_entities=without_custom_emoji(entities),
+                    link_preview=False,
+                )
+                updated += 1
+            except Exception as retry_exc:
+                LOG.error("Index message %s not refreshed: %s", message_id, retry_exc)
+        await asyncio.sleep(EDIT_DELAY)
+    return updated
 
 
 async def send_quote(
@@ -1328,6 +1579,81 @@ class CloneReport:
     # Kept so .test can read the source back and prove the order survived.
     source_posts: list[SourcePost] = field(default_factory=list)
     results: list[PostResult] = field(default_factory=list)
+    skipped: int = 0  # Posts the caption filter rejected.
+    index_after: int = 0  # Posts published before the index.
+    photo_copied: bool = False
+
+
+PHOTO_ACTIONS = (
+    types.MessageActionChatEditPhoto,
+    types.MessageActionChatDeletePhoto,
+)
+
+
+def service_message_ids(result: object, actions: tuple[type, ...]) -> list[int]:
+    """Collect the ids of service messages a request's updates announced."""
+    ids: list[int] = []
+    for update in getattr(result, "updates", None) or []:
+        message = getattr(update, "message", None)
+        if message is None:
+            continue
+        if isinstance(getattr(message, "action", None), actions):
+            ids.append(message.id)
+    return ids
+
+
+async def sweep_service_messages(
+    client: TelegramClient, peer: PeerRef, actions: tuple[type, ...], scan: int = 20
+) -> list[int]:
+    """Find recent service messages of the given kinds, newest first."""
+    found: list[int] = []
+    async for message in client.iter_messages(peer.input_peer, limit=scan):
+        if isinstance(getattr(message, "action", None), actions):
+            found.append(message.id)
+    return found
+
+
+async def copy_profile_photo(
+    client: TelegramClient, source: PeerRef, target: PeerRef
+) -> bool:
+    """Give the clone the source's profile photo, leaving no service message.
+
+    Telegram announces a photo change with a service message in the channel.
+    Setting the photo last and deleting that message keeps it out of the middle
+    of the cloned posts, which is the only reason the order matters here.
+    """
+    with tempfile.TemporaryDirectory(prefix="redirect-pfp-") as temp_dir:
+        path = await retry_on_wait(
+            client.download_profile_photo,
+            source.input_peer,
+            file=str(Path(temp_dir) / "photo.jpg"),
+        )
+        if not path:
+            LOG.info("%s has no profile photo to copy.", source.title)
+            return False
+        handle = await retry_on_wait(client.upload_file, path)
+        result = await retry_on_wait(
+            client,
+            functions.channels.EditPhotoRequest(
+                channel=target.input_channel,
+                photo=types.InputChatUploadedPhoto(file=handle),
+            ),
+        )
+
+    ids = service_message_ids(result, PHOTO_ACTIONS)
+    if not ids:
+        # Some layers answer without the service message in the updates, so
+        # look for it in the channel instead of leaving it behind.
+        ids = await sweep_service_messages(client, target, PHOTO_ACTIONS)
+    if ids:
+        try:
+            await retry_on_wait(client.delete_messages, target.input_peer, ids)
+            LOG.info("Copied the profile photo and removed its service message.")
+        except Exception as exc:
+            LOG.warning("Profile photo set, but its service message stayed: %s", exc)
+    else:
+        LOG.info("Copied the profile photo.")
+    return True
 
 
 async def create_clone_channel(client: TelegramClient, title: str) -> PeerRef:
@@ -1342,26 +1668,66 @@ async def create_clone_channel(client: TelegramClient, title: str) -> PeerRef:
 
 
 async def clone_source(
-    client: TelegramClient, slot: Slot, suffix: str, limit: int | None = None
+    client: TelegramClient,
+    slot: Slot,
+    suffix: str,
+    limit: int | None = None,
+    caption_filter: str = "",
 ) -> CloneReport:
     """Copy a source into a brand new channel and index it."""
     source = slot.source
     LOG.info("Reading %s...", source.title)
-    posts = await collect_source_posts(client, source, suffix, limit)
+    scan = await collect_source_posts(client, source, suffix, limit, caption_filter)
+    posts = scan.posts
     if not posts:
+        if scan.skipped:
+            raise RuntimeError(
+                f"no post in {source.title} has {caption_filter!r} in its caption "
+                f"({scan.skipped} skipped)"
+            )
         raise RuntimeError(f"{source.title} has no posts to clone")
-    LOG.info("%s: %s post(s) to clone.", source.title, len(posts))
+    if scan.skipped:
+        LOG.info(
+            "%s: %s post(s) match %r, %s skipped.",
+            source.title,
+            len(posts),
+            caption_filter,
+            scan.skipped,
+        )
+    else:
+        LOG.info("%s: %s post(s) to clone.", source.title, len(posts))
 
     target = await create_clone_channel(client, slot.clone_title())
 
+    # The source keeps its index after this many posts; None means at the end.
+    index_after = len(posts) if scan.index_after is None else scan.index_after
+    if scan.index_after is not None and scan.index_after < len(posts):
+        LOG.info(
+            "%s: the index goes after post %s, as in the source.",
+            slot.name,
+            index_after,
+        )
+
     id_map: dict[int, int] = {}
     results: list[PostResult] = []
+    posted_index = IndexPost()
+
+    async def place_index() -> None:
+        """Post the index here, with whatever links already exist."""
+        nonlocal posted_index
+        entries = build_index_entries(posts, results, target)
+        posted_index = await post_index(client, target, entries, suffix)
+
     for post in posts:
+        if len(results) == index_after:
+            await place_index()
         results.append(await clone_one_post(client, target, post, id_map))
         done = len(results)
         if done % 20 == 0 or done == len(posts):
             LOG.info("%s: cloned %s/%s post(s).", slot.name, done, len(posts))
         await asyncio.sleep(SEND_DELAY)
+    if len(results) == index_after:
+        await place_index()  # The index belongs at the very end.
 
     gaps = [result.ordinal for result in results if not result.ok]
     degraded = sum(1 for result in results if result.degraded)
@@ -1376,8 +1742,19 @@ async def clone_source(
     if degraded:
         LOG.warning("%s: %s post(s) lost their premium emoji.", slot.name, degraded)
 
+    # The photo goes on last so its service message lands after every post,
+    # where it can be deleted without leaving a hole among the clones.
+    photo_copied = False
+    try:
+        photo_copied = await copy_profile_photo(client, source, target)
+    except Exception as exc:
+        LOG.warning("%s: could not copy the profile photo: %s", slot.name, exc)
+
+    # Now that every post exists, the index lines can point at them.
     entries = build_index_entries(posts, results, target)
-    index_messages = await post_index(client, target, entries, suffix)
+    refreshed = await refresh_index(client, target, posted_index, entries, suffix)
+    if refreshed:
+        LOG.info("%s: filled in %s index message(s).", slot.name, refreshed)
 
     exported = await retry_on_wait(
         client,
@@ -1393,7 +1770,7 @@ async def clone_source(
         len(posts) - len(gaps),
         len(posts),
         target.title,
-        index_messages,
+        posted_index.count,
     )
     return CloneReport(
         peer=target,
@@ -1401,10 +1778,13 @@ async def clone_source(
         posts=len(posts) - len(gaps),
         gaps=gaps,
         degraded=degraded,
-        index_messages=index_messages,
+        index_messages=posted_index.count,
         total=len(posts),
         source_posts=posts,
         results=results,
+        skipped=scan.skipped,
+        index_after=index_after,
+        photo_copied=photo_copied,
     )
 
 
@@ -1439,7 +1819,9 @@ async def verify_clone_order(
     clone in the same way the source was walked and asserts that the Nth post
     of the clone is the Nth post of the source, by caption and by album size.
     """
-    cloned = await collect_source_posts(client, report.peer, suffix)
+    # The clone is read with no caption filter: whatever the filter let through
+    # is already all that was published, and re-filtering would hide a fault.
+    cloned = (await collect_source_posts(client, report.peer, suffix)).posts
     expected = [
         post
         for post, result in zip(report.source_posts, report.results, strict=True)
@@ -1567,21 +1949,9 @@ async def publish_links(
 
     posts: list[LinkPost] = []
     for dest, members in grouped.values():
-        # With more than one clone per source the slot name alone would repeat,
-        # so those lines are numbered and a lone clone keeps a clean label.
-        totals: dict[str, int] = {}
-        for clone in members:
-            totals[clone.slot] = totals.get(clone.slot, 0) + 1
-        seen: dict[str, int] = {}
-        entries: list[IndexEntry] = []
-        for position, clone in enumerate(members, start=1):
-            seen[clone.slot] = seen.get(clone.slot, 0) + 1
-            label = clone.slot
-            if totals[clone.slot] > 1:
-                label = f"{clone.slot} {seen[clone.slot]}"
-            entries.append(IndexEntry(ordinal=position, title=label, url=clone.link))
+        links = [clone.link for clone in members]
         message_ids: list[int] = []
-        for text, entities in make_quote_messages(entries):
+        for text, entities in render_link_messages(links, state.link_repeat):
             try:
                 sent = await send_quote(client, dest, text, entities)
             except Exception as exc:
@@ -1600,7 +1970,12 @@ async def publish_links(
             message_ids.append(sent.id)
             await asyncio.sleep(SEND_DELAY)
         if message_ids:
-            LOG.info("Published %s link(s) in %r.", len(members), dest.title)
+            LOG.info(
+                "Published %s link(s) in %r, each repeated %s time(s).",
+                len(members),
+                dest.title,
+                state.link_repeat,
+            )
             posts.append(LinkPost(dest=dest, message_ids=message_ids))
     return posts
 
@@ -1625,7 +2000,9 @@ async def run_cycle(client: TelegramClient, state: State, suffix: str) -> int:
     for slot in slots:
         for copy_number in range(1, state.clones_per_source + 1):
             try:
-                report = await clone_source(client, slot, suffix)
+                report = await clone_source(
+                    client, slot, suffix, caption_filter=state.caption_filter
+                )
             except Exception as exc:
                 LOG.error("%s: clone %s failed: %s", slot.name, copy_number, exc)
                 continue
@@ -1726,6 +2103,8 @@ COMMAND_HELP = (
     ".unassign NAME            forget where NAME's links go\n"
     f".interval MINUTES         rotation interval, {MIN_INTERVAL_MINUTES} or more\n"
     ".clones N                 clones to create per source each cycle\n"
+    ".links N                  times each invite link is repeated\n"
+    ".filter WORD | off        clone only posts with WORD in the caption\n"
     ".start                    start rotating\n"
     ".stop                     stop rotating and wipe the live clones\n"
     ".rotate                   wipe and rebuild now\n"
@@ -1883,6 +2262,49 @@ async def command_clones(runtime: Runtime, event: object, args: list[str]) -> No
     await set_status(event, f"Clones per source: {count}")
 
 
+async def command_links(runtime: Runtime, event: object, args: list[str]) -> None:
+    """Set how many times each invite link is repeated in the link post."""
+    state = runtime.state
+    if not args:
+        await set_status(event, f"Link lines per clone: {state.link_repeat}")
+        return
+    try:
+        count = int(args[0])
+    except ValueError:
+        await set_status(event, "Usage: .links N")
+        return
+    if count < 1 or count > MAX_LINK_REPEAT:
+        await set_status(event, f"Between 1 and {MAX_LINK_REPEAT}.")
+        return
+    state.link_repeat = count
+    state.save()
+    LOG.info("Link lines per clone set to %s.", count)
+    await set_status(event, f"Link lines per clone: {count}")
+
+
+async def command_filter(runtime: Runtime, event: object, args: list[str]) -> None:
+    """Set the caption word a post must carry to be cloned."""
+    state = runtime.state
+    if not args:
+        current = state.caption_filter or "off"
+        await set_status(event, f"Caption filter: {current}")
+        return
+    word = args[0]
+    if word.lower() in {"off", "none", "-"}:
+        state.caption_filter = ""
+        state.save()
+        LOG.info("Caption filter cleared.")
+        await set_status(event, "Caption filter: off")
+        return
+    if len(word) > 64:
+        await set_status(event, "That filter word is too long.")
+        return
+    state.caption_filter = word
+    state.save()
+    LOG.info("Caption filter set to %r.", word)
+    await set_status(event, f"Caption filter: {word}")
+
+
 async def command_start(runtime: Runtime, event: object, args: list[str]) -> None:
     """Start the rotation loop."""
     state = runtime.state
@@ -1955,9 +2377,19 @@ async def run_slot_test(
     lines = [f"Test: {slot.name}"]
     ok = True
 
-    report = await clone_source(runtime.client, slot, runtime.suffix, limit=posts)
-    lines.append(f"source      {slot.source.title}, {report.total} post(s) sampled")
+    report = await clone_source(
+        runtime.client,
+        slot,
+        runtime.suffix,
+        limit=posts,
+        caption_filter=state.caption_filter,
+    )
+    sampled = f"{report.total} post(s) sampled"
+    if state.caption_filter:
+        sampled += f", {report.skipped} without {state.caption_filter!r} skipped"
+    lines.append(f"source      {slot.source.title}, {sampled}")
     lines.append(f"channel     created as {report.peer.title}")
+    lines.append(f"photo       {'copied' if report.photo_copied else 'none to copy'}")
 
     if report.gaps:
         ok = False
@@ -1974,7 +2406,12 @@ async def run_slot_test(
     lines.append(f"order       {check.summary()}")
 
     if report.index_messages:
-        lines.append(f"index       {report.index_messages} message(s)")
+        placed = (
+            "at the end"
+            if report.index_after >= report.total
+            else f"after post {report.index_after}, as in the source"
+        )
+        lines.append(f"index       {report.index_messages} message(s) {placed}")
     else:
         ok = False
         lines.append("index       not posted")
@@ -1998,7 +2435,10 @@ async def run_slot_test(
         state.test_link_posts.extend(published)
         state.save()
         if published:
-            lines.append(f"links       published in {slot.dest.title}")
+            lines.append(
+                f"links       published in {slot.dest.title}, "
+                f"repeated {state.link_repeat}x"
+            )
         else:
             ok = False
             lines.append(f"links       failed in {slot.dest.title}")
@@ -2075,6 +2515,8 @@ async def command_status(runtime: Runtime, event: object, args: list[str]) -> No
         f"Rotating: {'yes' if runtime.rotating else 'no'}",
         f"Interval: {state.interval_minutes} minutes",
         f"Clones per source: {state.clones_per_source}",
+        f"Link lines per clone: {state.link_repeat}",
+        f"Caption filter: {state.caption_filter or 'off'}",
         f"Cycle: {state.cycle}",
     ]
     if state.published_at:
@@ -2110,6 +2552,8 @@ COMMANDS: dict[str, Callable[[Runtime, object, list[str]], Awaitable[None]]] = {
     "unassign": command_unassign,
     "interval": command_interval,
     "clones": command_clones,
+    "links": command_links,
+    "filter": command_filter,
     "start": command_start,
     "stop": command_stop,
     "rotate": command_rotate,
@@ -2162,11 +2606,16 @@ async def main() -> None:
         # Nothing has been configured in Telegram yet, so the .env decides.
         state.interval_minutes = settings.interval_minutes
         state.clones_per_source = settings.clones_per_source
+        state.link_repeat = settings.link_repeat
+        state.caption_filter = settings.caption_filter
         state.save()
         LOG.info(
-            "First run: interval %s minutes, %s clone(s) per source.",
+            "First run: interval %s minutes, %s clone(s) per source, "
+            "%s link line(s), caption filter %s.",
             state.interval_minutes,
             state.clones_per_source,
+            state.link_repeat,
+            state.caption_filter or "off",
         )
 
     client = TelegramClient(settings.session, settings.api_id, settings.api_hash)

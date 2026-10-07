@@ -116,11 +116,14 @@ Public handles and links need no join, since public history is readable without 
 
 Expired and invalid invites are reported and nothing is created.
 
+- The clone gets the source's **profile photo** and **description**. The "channel photo updated" service message Telegram adds is deleted.
 - Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
+- **Post numbering holds.** Every source post is numbered before anything is sent. A post Telegram refuses is retried without its premium emoji, then re-uploaded, so it keeps its place; one that still fails is reported by number instead of silently shifting every later post up.
+- **The index goes where the source keeps its own.** If the source's index sits after post 40, the clone's index goes after post 40 too, and the posts after it keep going below. Lines for those later posts are posted unlinked and filled in once they exist. With no index in the source, it goes at the end.
 - Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.
 - **Links between posts are repointed at the clone.** A post linking to `t.me/srcchan/45` ends up linking to the cloned copy of post 45 instead of back at the source. This covers both plain links in the text and markdown-style hyperlinks, where only the target changes and the visible text is left exactly as it was.
 - Media is reused by file reference, so nothing is downloaded in the normal case. Expired references fall back to a download and re-upload.
-- Media Telegram cannot resend, such as stories, is skipped and counted.
+- Media Telegram cannot resend, such as stories, is reported as a gap by its post number.
 - The invite link is sent to your **Saved Messages** together with the copy counts, and also printed in the terminal.
 
 ### How the link repointing works
@@ -543,7 +546,7 @@ Everything worked.
 
 ## Post numbering, and why this is not `main.py`'s `.clone`
 
-`main.py`'s `.clone` loses the ordering. It drops posts silently — service messages, its own index, anything whose media cannot be resent, anything whose caption Telegram refuses — and never accounts for the hole, so the source's 3rd post lands where the 2nd should be and the index points at the wrong post from there on. Its index also covers media posts only, so a plain text post shifts every later line.
+`main.py`'s `.clone` now numbers posts up front, retries refused posts, reports gaps by number, and puts the index where the source keeps it. `redirect.py` goes further: it rotates channels on a timer, copies the pin and content protection, handles dividers, and lists every post in the index (with an optional caption filter) rather than only media posts with a caption title.
 
 `redirect.py` treats the post number as a real value:
 

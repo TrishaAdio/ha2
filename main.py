@@ -696,6 +696,7 @@ def make_index_messages(
     entries: Iterable[IndexEntry],
     max_units: int = MAX_INDEX_UNITS,
     max_entities: int = MAX_INDEX_ENTITIES,
+    reserve_links: bool = False,
 ) -> Iterable[tuple[str, list[types.TypeMessageEntity]]]:
     """Build blockquoted index messages with custom-emoji linked titles.
 
@@ -703,6 +704,10 @@ def make_index_messages(
     Telegram's own limits: the 4096-character text limit, or its cap of about a
     hundred entities per message. A fixed entry count per message used to split
     a short index into several messages for no reason.
+
+    With reserve_links every entry is measured as though it were linked, so an
+    index posted before all of its posts exist splits into exactly the same
+    messages once the missing links are filled in by editing.
     """
     text = ""
     line_entities: list[types.TypeMessageEntity] = []
@@ -721,7 +726,7 @@ def make_index_messages(
         addition = f"{INDEX_CUSTOM_EMOJI} {display_title}\n"
         # Marker + bold title, plus the link when there is one, and one
         # blockquote wrapping whatever this message ends up holding.
-        needed = 2 + (1 if entry.url else 0)
+        needed = 2 + (1 if entry.url or reserve_links else 0)
         if entry_count and (
             utf16_length(text + addition) > max_units
             or len(line_entities) + needed + 1 > max_entities
@@ -796,17 +801,27 @@ def without_custom_emoji(
 
 
 async def send_index_sticker(
-    client: TelegramClient, entity: ChatEntity, reply_to: int | None
+    client: TelegramClient,
+    entity: ChatEntity,
+    reply_to: int | None,
+    sticker: object | None = None,
 ) -> bool:
-    """Send the index sticker, reporting failures without stopping the run."""
-    try:
-        await retry_on_wait(
-            client.send_file, entity, INDEX_STICKER, reply_to=reply_to
-        )
-        return True
-    except Exception as exc:  # A stale sticker reference must not lose the index.
-        warning(f"Index sticker skipped: {exc}")
-        return False
+    """Send the index sticker, reporting failures without stopping the run.
+
+    A sticker taken from the source is tried first: its file reference is
+    fresh, unlike the built-in constant's, which Telegram expires over time.
+    """
+    for candidate in (sticker, INDEX_STICKER):
+        if candidate is None:
+            continue
+        try:
+            await retry_on_wait(
+                client.send_file, entity, candidate, reply_to=reply_to
+            )
+            return True
+        except Exception as exc:  # A stale sticker reference must not lose the index.
+            warning(f"Index sticker failed: {exc}")
+    return False
 
 
 async def send_index_chunk(
@@ -815,9 +830,9 @@ async def send_index_chunk(
     reply_to: int | None,
     text: str,
     entities: Sequence[types.TypeMessageEntity],
-) -> None:
+) -> Message:
     """Send one styled index message into the destination chat or topic."""
-    await retry_on_wait(
+    return await retry_on_wait(
         client.send_message,
         entity,
         text,
@@ -825,6 +840,43 @@ async def send_index_chunk(
         reply_to=reply_to,
         link_preview=False,
     )
+
+
+async def post_index_messages(
+    client: TelegramClient,
+    entity: ChatEntity,
+    reply_to: int | None,
+    entries: Sequence[IndexEntry],
+    *,
+    sticker: object | None = None,
+    reserve_links: bool = False,
+) -> list[int | None]:
+    """Send the index sticker and every index chunk, returning the chunk ids.
+
+    The list holds one id per chunk, in order, with None for a chunk Telegram
+    refused, so a later refresh can match each chunk to its message.
+    """
+    if not entries:
+        return []
+
+    await send_index_sticker(client, entity, reply_to, sticker)
+
+    message_ids: list[int | None] = []
+    for text, entities in make_index_messages(entries, reserve_links=reserve_links):
+        sent: Message | None = None
+        try:
+            sent = await send_index_chunk(client, entity, reply_to, text, entities)
+        except Exception as exc:
+            # Custom emoji need Telegram Premium; retry with the plain emoji.
+            warning(f"Styled index chunk failed ({exc}); retrying without custom emoji.")
+            try:
+                sent = await send_index_chunk(
+                    client, entity, reply_to, text, without_custom_emoji(entities)
+                )
+            except Exception as retry_exc:
+                failure(f"Index chunk failed: {retry_exc}")
+        message_ids.append(sent.id if sent else None)
+    return message_ids
 
 
 async def post_index(
@@ -839,27 +891,8 @@ async def post_index(
     copier and .clone, which creates its destination and has no Dialog for it,
     can post the same index.
     """
-    if not entries:
-        return 0
-
-    await send_index_sticker(client, entity, reply_to)
-
-    count = 0
-    for text, entities in make_index_messages(entries):
-        try:
-            await send_index_chunk(client, entity, reply_to, text, entities)
-        except Exception as exc:
-            # Custom emoji need Telegram Premium; retry with the plain emoji.
-            warning(f"Styled index chunk failed ({exc}); retrying without custom emoji.")
-            try:
-                await send_index_chunk(
-                    client, entity, reply_to, text, without_custom_emoji(entities)
-                )
-            except Exception as retry_exc:
-                failure(f"Index chunk failed: {retry_exc}")
-                continue
-        count += 1
-    return count
+    message_ids = await post_index_messages(client, entity, reply_to, entries)
+    return sum(1 for message_id in message_ids if message_id is not None)
 
 
 async def get_supported_dialogs(client: TelegramClient) -> list[Dialog]:
@@ -1384,21 +1417,34 @@ async def repoint_clone_links(
             continue
 
         new_text, new_entities = result
-        try:
-            await retry_on_wait(
-                client.edit_message,
-                links.target,
-                new_id,
-                new_text,
-                formatting_entities=new_entities,
-                link_preview=bool(source_message.web_preview),
-            )
-            repointed += 1
-        except errors.MessageNotModifiedError:
-            untouched += 1
-        except Exception as exc:  # noqa: BLE001
+        # Premium emoji first; a post cloned without them is edited without them.
+        attempts = [new_entities]
+        plain = without_custom_emoji(new_entities)
+        if len(plain) != len(new_entities):
+            attempts.append(plain)
+        last_error: Exception | None = None
+        for entities in attempts:
+            try:
+                await retry_on_wait(
+                    client.edit_message,
+                    links.target,
+                    new_id,
+                    new_text,
+                    formatting_entities=entities,
+                    link_preview=bool(source_message.web_preview),
+                )
+                repointed += 1
+                last_error = None
+                break
+            except errors.MessageNotModifiedError:
+                untouched += 1
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+        if last_error is not None:
             failed += 1
-            failure(f"Could not repoint links in cloned post {new_id}: {exc}")
+            failure(f"Could not repoint links in cloned post {new_id}: {last_error}")
         await asyncio.sleep(EDIT_DELAY)
     return repointed, untouched, failed
 
@@ -1520,12 +1566,39 @@ def clone_input_media(message: Message) -> object | None:
     return input_media
 
 
-async def iter_clone_batches(
+@dataclass
+class ClonePlan:
+    """The numbered posts of a source, and where its own index sat."""
+
+    # Post N of the source is posts[N - 1]: one message, or a whole album.
+    posts: list[list[Message]]
+    # How many posts came before the source's own index, so the clone puts its
+    # index back in the same place. None means the source had none: the end.
+    index_after: int | None = None
+    # The source's own index sticker, with a fresh file reference.
+    index_sticker: object | None = None
+
+
+async def collect_clone_posts(
     client: TelegramClient, source: ChatEntity
-) -> AsyncIterator[list[Message]]:
-    """Yield every source post oldest first, keeping albums together."""
+) -> ClonePlan:
+    """Read and number every source post, oldest first, before sending any.
+
+    Numbering up front is what keeps the order honest: once a post owns its
+    number, a later failure cannot hand that number to the next post.
+
+    The source's own index is not copied, because it links back at the source,
+    but its position is recorded so the clone's index lands after the same post.
+    """
+    plan = ClonePlan(posts=[])
     album: list[Message] = []
     album_id: int | None = None
+
+    def flush() -> None:
+        nonlocal album, album_id
+        if album:
+            plan.posts.append(album)
+        album, album_id = [], None
 
     async for message in client.iter_messages(source, reverse=True):
         if message.action is not None:
@@ -1533,25 +1606,28 @@ async def iter_clone_batches(
         if not message.message and message.media is None:
             continue
         if is_index_sticker(message) or looks_like_index(message):
-            # The source's own index points at the source. A fresh one is
-            # posted at the end, so copying this would leave two.
+            flush()
+            if plan.index_after is None:
+                plan.index_after = len(plan.posts)
+            if plan.index_sticker is None and is_index_sticker(message):
+                with contextlib.suppress(Exception):
+                    plan.index_sticker = clone_input_media(message)
             continue
 
         if message.grouped_id is None:
-            if album:
-                yield album
-                album, album_id = [], None
-            yield [message]
+            flush()
+            plan.posts.append([message])
             continue
-
         if album and message.grouped_id != album_id:
-            yield album
-            album = []
+            flush()
         album_id = message.grouped_id
         album.append(message)
 
-    if album:
-        yield album
+    flush()
+    # Album parts are kept in the order Telegram stored them.
+    for post in plan.posts:
+        post.sort(key=lambda part: part.id)
+    return plan
 
 
 async def send_clone_batch(
@@ -1560,6 +1636,7 @@ async def send_clone_batch(
     batch: Sequence[Message],
     medias: Sequence[object],
     id_map: dict[int, int],
+    keep_custom_emoji: bool = True,
 ) -> list[Message]:
     """Publish one cloned post or album, keeping replies pointing correctly."""
     first = batch[0]
@@ -1568,12 +1645,16 @@ async def send_clone_batch(
     if replied is not None and replied in id_map:
         reply_to = types.InputReplyToMessage(reply_to_msg_id=id_map[replied])
 
+    def entities_of(message: Message) -> list[types.TypeMessageEntity]:
+        entities = list(message.entities or [])
+        return entities if keep_custom_emoji else without_custom_emoji(entities)
+
     if len(batch) > 1:
         items = [
             types.InputSingleMedia(
                 media=media,
                 message=message.message or "",
-                entities=list(message.entities or []),
+                entities=entities_of(message),
             )
             for message, media in zip(batch, medias, strict=True)
         ]
@@ -1586,13 +1667,14 @@ async def send_clone_batch(
         )
         if not produced:
             return []
-        return list(produced) if isinstance(produced, list) else [produced]
+        produced = list(produced) if isinstance(produced, list) else [produced]
+        return [message for message in produced if message is not None]
 
     if medias[0] is None:
         query = functions.messages.SendMessageRequest(
             peer=target,
             message=first.message,
-            entities=list(first.entities or []),
+            entities=entities_of(first),
             no_webpage=not first.web_preview,
             reply_to=reply_to,
         )
@@ -1601,7 +1683,7 @@ async def send_clone_batch(
             peer=target,
             media=medias[0],
             message=first.message or "",
-            entities=list(first.entities or []),
+            entities=entities_of(first),
             reply_to=reply_to,
         )
     result = await retry_on_wait(client, query)
@@ -1633,29 +1715,238 @@ async def reuploaded_media(
     )
 
 
-def clone_index_entry(
-    batch: Sequence[Message],
-    sent: Sequence[Message],
-    target: types.Channel,
-) -> IndexEntry | None:
-    """Build the index entry for one cloned post, or None when it needs none.
+@dataclass
+class ClonedPost:
+    """What became of one numbered source post in the clone."""
 
-    Only media posts are indexed, matching reindex.py: a plain text post is a
-    post, not a caption, so it never becomes an index title.
+    number: int
+    sent: list[Message]
+    degraded: bool = False  # Published without its premium emoji.
+    reason: str | None = None  # Why it could not be cloned at all.
+
+
+async def clone_one_post(
+    client: TelegramClient,
+    target: types.Channel,
+    number: int,
+    batch: Sequence[Message],
+    id_map: dict[int, int],
+) -> ClonedPost:
+    """Recreate one numbered post, trying progressively weaker copies.
+
+    Giving up at the first refusal is what used to shift the numbering. Here a
+    caption Telegram rejects costs the post its premium emoji, an expired file
+    costs a re-upload, and only a post that fails every attempt becomes a gap,
+    which is reported by number instead of silently pulling the rest up.
     """
-    position = caption_position(batch)
-    if position is None:
-        return None
-    source_message = batch[position]
-    if source_message.media is None or isinstance(
-        source_message.media, types.MessageMediaWebPage
-    ):
-        return None
-    title = index_title(source_message.message)
-    if not title:
-        return None
-    cloned = sent[min(position, len(sent) - 1)]
-    return IndexEntry(title=title, url=message_link(target, cloned.id))
+    ids = ", ".join(str(message.id) for message in batch)
+    premium = any(
+        isinstance(entity, types.MessageEntityCustomEmoji)
+        for message in batch
+        for entity in message.entities or []
+    )
+    # (label, re-upload the media, keep premium emoji)
+    attempts: list[tuple[str, bool, bool]] = [("as is", False, True)]
+    if premium:
+        attempts.append(("without premium emoji", False, False))
+    attempts.append(("re-uploaded", True, True))
+    if premium:
+        attempts.append(("re-uploaded without premium emoji", True, False))
+
+    last_error = "unknown error"
+    for label, reupload, keep_emoji in attempts:
+        try:
+            if reupload:
+                with tempfile.TemporaryDirectory(prefix="clone-") as temp_dir:
+                    medias = [
+                        await reuploaded_media(client, message, Path(temp_dir))
+                        for message in batch
+                    ]
+                    sent = await send_clone_batch(
+                        client, target, batch, medias, id_map, keep_emoji
+                    )
+            else:
+                medias = [clone_input_media(message) for message in batch]
+                sent = await send_clone_batch(
+                    client, target, batch, medias, id_map, keep_emoji
+                )
+        except STALE_MEDIA_ERRORS as exc:
+            last_error = type(exc).__name__
+            warning(f"Post {number} ({ids}): file reference expired, re-uploading.")
+            continue
+        except Exception as exc:  # noqa: BLE001  One bad post must not end the clone.
+            last_error = str(exc) or type(exc).__name__
+            warning(f"Post {number} ({ids}) failed {label}: {last_error}")
+            continue
+        if not sent:
+            last_error = "Telegram returned no message"
+            continue
+
+        sent = sorted(sent, key=lambda message: message.id)
+        if len(sent) == len(batch):
+            for source_message, new_message in zip(batch, sent, strict=True):
+                id_map[source_message.id] = new_message.id
+        else:
+            # Zipping lists of different lengths maps replies onto wrong posts.
+            id_map[batch[0].id] = sent[0].id
+        if label != "as is":
+            info(f"Post {number} ({ids}) cloned {label}.")
+        return ClonedPost(number, sent, degraded=not keep_emoji)
+
+    failure(f"Post {number} ({ids}) could not be cloned: {last_error}")
+    return ClonedPost(number, [], reason=last_error)
+
+
+def clone_index_entries(
+    posts: Sequence[Sequence[Message]],
+    results: Sequence[ClonedPost],
+    target: types.Channel,
+) -> list[IndexEntry]:
+    """Build the index lines in source post order.
+
+    Only media posts with a caption title are listed, matching reindex.py. Every
+    entry exists from the start, so a post not cloned yet, or that could not be
+    cloned, is a line without a link rather than a missing line.
+    """
+    entries: list[IndexEntry] = []
+    for number, batch in enumerate(posts, start=1):
+        position = caption_position(batch)
+        if position is None:
+            continue
+        source_message = batch[position]
+        if source_message.media is None or isinstance(
+            source_message.media, types.MessageMediaWebPage
+        ):
+            continue
+        title = index_title(source_message.message)
+        if not title:
+            continue
+        url = None
+        if number <= len(results) and results[number - 1].sent:
+            sent = results[number - 1].sent
+            cloned = sent[position] if position < len(sent) else sent[0]
+            url = message_link(target, cloned.id)
+        entries.append(IndexEntry(title=title, url=url))
+    return entries
+
+
+def chunk_urls(chunk: tuple[str, list[types.TypeMessageEntity]]) -> list[str]:
+    """Return the links one index chunk carries, in order."""
+    return [
+        entity.url
+        for entity in chunk[1]
+        if isinstance(entity, types.MessageEntityTextUrl)
+    ]
+
+
+async def refresh_clone_index(
+    client: TelegramClient,
+    target: types.Channel,
+    message_ids: Sequence[int | None],
+    posted: Sequence[IndexEntry],
+    final: Sequence[IndexEntry],
+) -> int:
+    """Edit an index posted mid-clone so every line links to its finished post.
+
+    Both layouts reserve room for every link, so chunk N of the final index is
+    exactly the text of index message N; only the links differ.
+    """
+    before = list(make_index_messages(posted, reserve_links=True))
+    after = list(make_index_messages(final, reserve_links=True))
+    updated = 0
+    for message_id, old, new in zip(message_ids, before, after, strict=False):
+        if message_id is None or chunk_urls(old) == chunk_urls(new):
+            continue
+        text, entities = new
+        for attempt in (entities, without_custom_emoji(entities)):
+            try:
+                await retry_on_wait(
+                    client.edit_message,
+                    target,
+                    message_id,
+                    text,
+                    formatting_entities=list(attempt),
+                    link_preview=False,
+                )
+                updated += 1
+                break
+            except errors.MessageNotModifiedError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                warning(f"Could not fill in index message {message_id}: {exc}")
+        await asyncio.sleep(EDIT_DELAY)
+    return updated
+
+
+PHOTO_ACTIONS = (types.MessageActionChatEditPhoto, types.MessageActionChatDeletePhoto)
+
+
+async def read_chat_about(client: TelegramClient, source: ChatEntity) -> str:
+    """Return the source's description (bio), or an empty string."""
+    if isinstance(source, types.Channel):
+        request = functions.channels.GetFullChannelRequest(channel=source)
+    else:
+        request = functions.messages.GetFullChatRequest(chat_id=source.id)
+    full = await retry_on_wait(client, request)
+    return getattr(full.full_chat, "about", "") or ""
+
+
+async def copy_chat_about(
+    client: TelegramClient, source: ChatEntity, target: types.Channel
+) -> bool:
+    """Give the clone the source's description. Returns whether one was set."""
+    about = await read_chat_about(client, source)
+    if not about.strip():
+        info("The source has no description to copy.")
+        return False
+    await retry_on_wait(
+        client, functions.messages.EditChatAboutRequest(peer=target, about=about)
+    )
+    success("Copied the description.")
+    return True
+
+
+async def copy_chat_photo(
+    client: TelegramClient, source: ChatEntity, target: types.Channel
+) -> bool:
+    """Give the clone the source's profile photo, leaving no service message.
+
+    Telegram announces a photo change with a "channel photo updated" service
+    message, which is deleted so it does not sit among the cloned posts.
+    """
+    with tempfile.TemporaryDirectory(prefix="clone-photo-") as temp_dir:
+        path = await retry_on_wait(
+            client.download_profile_photo,
+            source,
+            file=str(Path(temp_dir) / "photo.jpg"),
+            download_big=True,
+        )
+        if not path:
+            info("The source has no profile photo to copy.")
+            return False
+        handle = await retry_on_wait(client.upload_file, path)
+        result = await retry_on_wait(
+            client,
+            functions.channels.EditPhotoRequest(
+                channel=target, photo=types.InputChatUploadedPhoto(file=handle)
+            ),
+        )
+
+    service_ids = [
+        update.message.id
+        for update in getattr(result, "updates", None) or []
+        if isinstance(getattr(getattr(update, "message", None), "action", None), PHOTO_ACTIONS)
+    ]
+    if not service_ids:
+        # Some layers leave it out of the updates, so look in the channel.
+        async for message in client.iter_messages(target, limit=10):
+            if isinstance(message.action, PHOTO_ACTIONS):
+                service_ids.append(message.id)
+    if service_ids:
+        with contextlib.suppress(Exception):
+            await retry_on_wait(client.delete_messages, target, service_ids)
+    success("Copied the profile photo.")
+    return True
 
 
 async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
@@ -1665,8 +1956,10 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     chat, by invite link, public link or @handle, clones that chat instead
     and any remaining words become the new title.
 
-    Once every post is copied, links between posts are repointed at the clone
-    and the styled linked index is posted, so the clone needs no reindex.py run.
+    The clone gets the source's profile photo and description. Every post is
+    numbered before anything is sent, the styled linked index goes after the
+    same post the source keeps its own index after, and once every post exists
+    the index and the links between posts are pointed at the clone.
     """
     title_words = list(args)
     if args and looks_like_chat_reference(args[0]):
@@ -1687,16 +1980,43 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         await set_status(event, "That chat cannot be cloned.")
         return
 
-    title = " ".join(title_words).strip() or utils.get_display_name(source) or "Clone"
-    info(f"Cloning {utils.get_display_name(source)} into a private channel...")
-    await set_status(event, f"Creating private channel {title!r}...")
+    source_name = utils.get_display_name(source)
+    title = " ".join(title_words).strip() or source_name or "Clone"
+    info(f"Reading {source_name}...")
+    await set_status(event, f"Reading {source_name}...")
+    plan = await collect_clone_posts(client, source)
+    posts = plan.posts
+    if not posts:
+        await set_status(event, f"{source_name} has no posts to clone.")
+        return
+    # The index goes after this many posts; with no index in the source, last.
+    index_after = len(posts) if plan.index_after is None else plan.index_after
+    where = (
+        f"after post {index_after}, as in the source"
+        if plan.index_after is not None
+        else "at the end"
+    )
+    info(f"{len(posts)} post(s) to clone; the index goes {where}.")
 
+    await set_status(event, f"Creating private channel {title!r}...")
     created = await retry_on_wait(
         client,
         functions.channels.CreateChannelRequest(title=title, about="", broadcast=True),
     )
     target = channel_from_updates(created)
     success(f"Created private channel {title!r} (id {target.id}).")
+
+    copied_details: list[str] = []
+    try:
+        if await copy_chat_photo(client, source, target):
+            copied_details.append("profile photo")
+    except Exception as exc:  # noqa: BLE001
+        warning(f"Could not copy the profile photo: {exc}")
+    try:
+        if await copy_chat_about(client, source, target):
+            copied_details.append("description")
+    except Exception as exc:  # noqa: BLE001
+        warning(f"Could not copy the description: {exc}")
 
     if getattr(source, "noforwards", False):
         warning("Source has content protection enabled; some media may be refused.")
@@ -1709,53 +2029,54 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         id_map=id_map,
     )
     pending_links: list[tuple[int, Message]] = []
-    index_entries: list[IndexEntry] = []
-    copied = skipped = failed = 0
-    await set_status(event, f"Cloning into {title!r}...")
+    results: list[ClonedPost] = []
+    index_ids: list[int | None] = []
+    index_posted: list[IndexEntry] = []
+    await set_status(event, f"Cloning {len(posts)} post(s) into {title!r}...")
 
-    async for batch in iter_clone_batches(client, source):
-        ids = ", ".join(str(message.id) for message in batch)
-        try:
-            medias = [clone_input_media(message) for message in batch]
-        except (TypeError, ValueError, AttributeError) as exc:
-            skipped += len(batch)
-            warning(f"Skipping {ids} ({exc}).")
-            continue
+    async def place_index() -> None:
+        """Post the index here, linking whatever already exists."""
+        nonlocal index_ids, index_posted
+        index_posted = clone_index_entries(posts, results, target)
+        if not index_posted:
+            return
+        info(f"Posting the index after post {len(results)}...")
+        index_ids = await post_index_messages(
+            client,
+            target,
+            None,
+            index_posted,
+            sticker=plan.index_sticker,
+            reserve_links=True,
+        )
+        await asyncio.sleep(CLONE_DELAY)
 
-        try:
-            sent = await send_clone_batch(client, target, batch, medias, id_map)
-        except STALE_MEDIA_ERRORS:
-            warning(f"File references for {ids} expired; re-uploading.")
-            try:
-                with tempfile.TemporaryDirectory(prefix="clone-") as temp_dir:
-                    fresh = [
-                        await reuploaded_media(client, message, Path(temp_dir))
-                        for message in batch
-                    ]
-                    sent = await send_clone_batch(client, target, batch, fresh, id_map)
-            except Exception as exc:  # noqa: BLE001
-                failed += len(batch)
-                failure(f"Gave up on {ids} ({exc}).")
-                continue
-        except Exception as exc:  # noqa: BLE001
-            failed += len(batch)
-            failure(f"Could not clone {ids} ({exc}).")
-            continue
-
-        if not sent:
-            failed += len(batch)
-            continue
-        for source_message, new_message in zip(batch, sent, strict=False):
-            id_map[source_message.id] = new_message.id
+    for number, batch in enumerate(posts, start=1):
+        if len(results) == index_after:
+            await place_index()
+        result = await clone_one_post(client, target, number, batch, id_map)
+        results.append(result)
+        for source_message, new_message in zip(batch, result.sent, strict=False):
             if links.present_in(source_message):
                 pending_links.append((new_message.id, source_message))
-        entry = clone_index_entry(batch, sent, target)
-        if entry is not None:
-            index_entries.append(entry)
-        copied += len(batch)
-        if copied % STATUS_EVERY == 0:
-            await set_status(event, f"Cloning into {title!r}... {copied} posts")
+        if number % STATUS_EVERY == 0:
+            await set_status(event, f"Cloning into {title!r}... {number}/{len(posts)}")
         await asyncio.sleep(CLONE_DELAY)
+    if len(results) == index_after:
+        await place_index()
+
+    gaps = [result.number for result in results if not result.sent]
+    degraded = sum(1 for result in results if result.degraded)
+    copied = len(posts) - len(gaps)
+
+    # Lines for posts after the index went out unlinked; link them now.
+    final_entries = clone_index_entries(posts, results, target)
+    if index_ids:
+        filled = await refresh_clone_index(
+            client, target, index_ids, index_posted, final_entries
+        )
+        if filled:
+            success(f"Filled in links in {filled} index message(s).")
 
     repointed = untouched = link_failures = 0
     if pending_links:
@@ -1768,34 +2089,31 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     else:
         info("No post carried a link to the source, so none needed repointing.")
 
-    index_messages = 0
-    if index_entries:
-        info(f"Posting the linked index for {len(index_entries)} post(s)...")
-        await set_status(event, f"Posting the index for {len(index_entries)} post(s)...")
-        index_messages = await post_index(client, target, None, index_entries)
-        success(f"Index posted in {index_messages} message(s).")
-    else:
-        info("No caption produced an index title, so no index was posted.")
-
     exported = await retry_on_wait(
         client,
         functions.messages.ExportChatInviteRequest(peer=target, title="clone"),
     )
     link = getattr(exported, "link", None) or "no link returned"
 
-    report = f"Cloned {copied} post(s) into {title!r}\n{link}"
-    if index_entries:
-        report += f"\nIndex: {len(index_entries)} entries in {index_messages} message(s)"
+    index_messages = sum(1 for message_id in index_ids if message_id is not None)
+    report = f"Cloned {copied}/{len(posts)} post(s) into {title!r}\n{link}"
+    if copied_details:
+        report += f"\nCopied: {', '.join(copied_details)}"
+    if index_ids:
+        report += (
+            f"\nIndex: {len(final_entries)} entries in {index_messages} message(s), "
+            f"after post {index_after}"
+        )
     if repointed:
         report += f"\nLinks repointed at the clone: {repointed}"
     if untouched:
         report += f"\nLinks left pointing at the source: {untouched}"
     if link_failures:
         report += f"\nLinks that could not be edited: {link_failures}"
-    if skipped:
-        report += f"\nSkipped: {skipped}"
-    if failed:
-        report += f"\nFailed: {failed}"
+    if degraded:
+        report += f"\nSent without premium emoji: {degraded}"
+    if gaps:
+        report += f"\nCould not clone post(s): {', '.join(str(number) for number in gaps)}"
 
     saved = True
     try:
@@ -1804,7 +2122,7 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         saved = False
         failure(f"Could not save the invite link to Saved Messages: {exc}")
 
-    success(f"Clone finished: {copied} copied, {skipped} skipped, {failed} failed.")
+    success(f"Clone finished: {copied}/{len(posts)} copied, {len(gaps)} gap(s).")
     success(f"Invite link: {link}")
     await set_status(
         event,

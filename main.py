@@ -2153,9 +2153,9 @@ async def run_commands(client: TelegramClient) -> None:
 
 
 def choose_mode() -> str:
-    """Pick between the interactive copier and the live command listener."""
+    """Pick between the copier, the command listener and the auto maker."""
     configured = (os.getenv("MAIN_MODE") or "").strip().lower()
-    if configured in {"copy", "commands"}:
+    if configured in {"copy", "commands", "auto"}:
         return configured
 
     print(Fore.YELLOW + Style.BRIGHT + "\n== MODE ==")
@@ -2164,13 +2164,19 @@ def choose_mode() -> str:
         Fore.GREEN + Style.BRIGHT + "  [  2] "
         + Fore.WHITE + "Command mode (.change, .clone)"
     )
+    print(
+        Fore.GREEN + Style.BRIGHT + "  [  3] "
+        + Fore.WHITE + "Auto maker (.login workers, .gen chats, .set links)"
+    )
     while True:
         choice = input(Fore.CYAN + "Select number > ").strip()
         if choice == "1":
             return "copy"
         if choice == "2":
             return "commands"
-        warning("Enter 1 or 2.")
+        if choice == "3":
+            return "auto"
+        warning("Enter 1, 2 or 3.")
 
 
 async def main() -> None:
@@ -2182,7 +2188,14 @@ async def main() -> None:
     await client.start()
     success("Telegram account connected.")
     try:
-        if choose_mode() == "commands":
+        mode = choose_mode()
+        if mode == "auto":
+            # Imported here, not at the top: automaker builds on this module,
+            # so importing it at import time would be a circular import.
+            from automaker import run_auto_maker
+
+            await run_auto_maker(client, api_id, api_hash)
+        elif mode == "commands":
             await run_commands(client)
         else:
             await run_copy(client)

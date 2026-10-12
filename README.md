@@ -2,7 +2,8 @@
 
 Five Telethon userbot scripts:
 
-- **`main.py`** copies every photo from one chat to another and posts a linked index, and also runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
+- **`main.py`** copies every photo from one chat to another and posts a linked index, runs a [command mode](#commands-mainpy-command-mode) with `.change` and `.clone`, and an [auto maker](#auto-maker-mainpy-mode-3) that creates chats through a pool of worker accounts. Channels, supergroups, forum groups, and legacy basic groups all work on both sides.
+- **`automaker.py`** is `main.py` mode 3: the worker pool, the `.login` flow and `.gen`. It is not run directly.
 - **`oho.py`** clones a whole source chat into many freshly created groups, using several backup accounts that share the work. See [oho.py](#ohopy-multi-account-group-cloner).
 - **`reindex.py`** adds the styled caption index to groups that already hold the copied posts, which is what `oho.py` leaves behind. See [reindex.py](#reindexpy-add-the-index-to-finished-groups).
 - **`lol.py`** deletes posts across your chats: `.delete <text>` removes every post containing a text in groups you moderate, and `.delme` removes every photo you sent, with its caption, everywhere. See [lol.py](#lolpy-delete-posts-by-text).
@@ -54,8 +55,9 @@ A Telethon userbot that copies every photo from a selected source chat to a sele
 
 1. **Copy photos between two chats** — the interactive copier described above.
 2. **Command mode** — stays connected and listens for `.change` and `.clone`.
+3. **Auto maker** — signs worker accounts in and creates a chat per worker on `.gen`, handing the invite link to your staff chat. See [auto maker](#auto-maker-mainpy-mode-3).
 
-Set `MAIN_MODE=copy` or `MAIN_MODE=commands` in `.env` to skip the question.
+Set `MAIN_MODE=copy`, `MAIN_MODE=commands` or `MAIN_MODE=auto` in `.env` to skip the question.
 
 # Commands (`main.py` command mode)
 
@@ -208,6 +210,77 @@ The entire list is a blockquote. Ordinary emoji found in source caption titles a
 - Only plain-text replies are copied. Replies carrying their own media are skipped.
 
 > The index described above is a `main.py` feature. `oho.py` copies content but does not post an index, so groups it creates start without one. Use [reindex.py](#reindexpy-add-the-index-to-finished-groups) to add it afterwards.
+
+# Auto maker (`main.py` mode 3)
+
+Mode 3 turns the signed-in account into an operator for a pool of **worker accounts**. A worker creates the chat; the operator joins it, is promoted to admin, and hands the invite link to the chat you nominate. Your own account never owns the chats and never spends its own creation quota.
+
+```text
+.set [link]            post the invite links in this chat
+.login [phone]         add a worker account (phone, code, 2FA)
+.gen [count] [title]   make chats with unused workers
+.accounts              list the workers and the settings
+.kind group|channel    what .gen creates
+.title Demo {n}        title template for new chats
+.reset [name|all]      mark workers unused again
+.remove <name>         forget a worker and its session
+.cancel                stop a login that is waiting
+.help                  show the list
+```
+
+## Setting it up
+
+```text
+.set                      # send this in your owner/staff chat
+.login +15551234567       # then answer with the code, and the 2FA password
+.login                    # repeat for as many workers as you want
+.gen                      # one chat from one unused worker
+.gen 5                    # five chats from five different workers
+```
+
+`.set` nominates the chat where links appear, and also takes a link, invite or `@handle` as its argument, so it works from anywhere. Without `.set`, links go to your Saved Messages.
+
+## `.login`
+
+`.login` asks for the phone number, then the login code, then the two-step password if the account has one. Answer each by sending an ordinary message in the same chat; `.cancel`, or 5 minutes of silence, stops the flow.
+
+- **Code and password messages are deleted the instant they are read**, and neither is ever printed or logged.
+- **Type the code by hand.** Telegram invalidates a login code it sees forwarded through a chat, so forwarding the "Login code" message to yourself will not work.
+- A wrong code or password can be retried three times. An expired code ends the flow; run `.login` again.
+- A number with no Telegram account is refused: sign it up in a real Telegram app first, since creating accounts is not something this does.
+- Re-running `.login` for an account that is already stored refreshes its session instead of adding it twice.
+
+## `.gen`
+
+One `.gen` is one chat from one worker:
+
+1. Picks a **random worker that has not been used yet**, so the accounts age evenly rather than in registration order.
+2. That worker creates the chat.
+3. The worker exports an invite link, and the operator joins with it. Joining by link is used rather than being added by the worker, because adding depends on both accounts' privacy settings while a fresh link always works.
+4. The worker promotes the operator to admin, with every right except the ability to promote further admins.
+5. The **operator** exports the link that is handed over, because an invite link dies with the account that made it and the operator is the account meant to outlive the workers.
+6. The link is posted in the `.set` chat, the worker is marked used, and the state file is written.
+
+If a worker cannot do the job it is **set aside with the reason and another worker is tried**, which is the point of a pool. A worker is set aside when its session is dead or revoked, the account is banned or deleted, it has created as many chats as Telegram allows, or Telegram wants a flood wait longer than `AUTOMAKER_MAX_WAIT` (default 300s). Short waits are simply waited out. `.accounts` shows every reason, and `.reset` puts a worker back in the pool.
+
+Titles come from `.title`, where `{n}` is a counter (`Demo 1`, `Demo 2`, …), or from the words after `.gen`. A worker that gets set aside does not burn a title number.
+
+## Groups and channels
+
+`.kind group` (the default) creates a **supergroup**, which is what a "gc" is. `.kind channel` creates a broadcast channel.
+
+Telegram has no API for turning a broadcast channel into a group afterwards, so the choice is made at creation time rather than converted later. The only conversion Telegram offers is legacy basic group to supergroup, which is not what either option does here.
+
+## The state file
+
+Workers, their sessions, the delivery chat and the settings live in `automaker_state.json` (`AUTOMAKER_STATE` to move it). It is written atomically, so an interrupted write cannot destroy it, and with owner-only permissions, because **a stored session string is full access to that account** — treat the file exactly like a password. It is already in `.gitignore`.
+
+`.remove` drops a worker from the file. That does not log the account out of Telegram; end the session from the account's own Telegram app too.
+
+## Limits worth knowing
+
+- Telegram caps how many channels and groups an account may create per day, and new accounts are limited hardest. A pool spreads this out, which is what the pool is for, but `.gen 50` across fresh accounts will still hit flood waits.
+- Ownership is not transferred. The worker stays the creator; the operator is an admin. Transferring ownership needs two-step verification on the worker and a session at least seven days old, which is why it is not done here.
 
 # oho.py: Multi-Account Group Cloner
 

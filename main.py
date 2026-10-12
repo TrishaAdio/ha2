@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1417,6 +1418,8 @@ async def repoint_clone_links(
             continue
 
         new_text, new_entities = result
+        new_entities = await outgoing_entities(client, new_text, new_entities)
+        wanted = formatting_kinds(new_entities, custom_emoji=False)
         # Premium emoji first; a post cloned without them is edited without them.
         attempts = [new_entities]
         plain = without_custom_emoji(new_entities)
@@ -1425,7 +1428,7 @@ async def repoint_clone_links(
         last_error: Exception | None = None
         for entities in attempts:
             try:
-                await retry_on_wait(
+                edited = await retry_on_wait(
                     client.edit_message,
                     links.target,
                     new_id,
@@ -1433,6 +1436,14 @@ async def repoint_clone_links(
                     formatting_entities=entities,
                     link_preview=bool(source_message.web_preview),
                 )
+                got = formatting_kinds(getattr(edited, "entities", None), custom_emoji=False)
+                if edited is not None and wanted - got:
+                    # Telegram took the new links but not all the formatting:
+                    # try the next form instead of calling this a success.
+                    last_error = RuntimeError(
+                        f"Telegram dropped {describe_missing(wanted, got)}"
+                    )
+                    continue
                 repointed += 1
                 last_error = None
                 break
@@ -1652,24 +1663,109 @@ async def collect_clone_posts(
     return plan
 
 
+def _units_text(text: str, start: int, end: int) -> str:
+    """Return the text between two UTF-16 offsets."""
+    return text.encode("utf-16-le")[start * 2 : end * 2].decode("utf-16-le", "ignore")
+
+
+def entity_kind(entity: types.TypeMessageEntity) -> str:
+    """Name an entity's kind, treating the forms of a user mention as one."""
+    if isinstance(entity, (types.MessageEntityMentionName, types.InputMessageEntityMentionName)):
+        return "mention"
+    if isinstance(entity, types.MessageEntityTextUrl) and entity.url.startswith("tg://user"):
+        return "mention"
+    return type(entity).__name__.removeprefix("MessageEntity")
+
+
+def formatting_kinds(
+    entities: Sequence[types.TypeMessageEntity] | None, *, custom_emoji: bool = True
+) -> Counter[str]:
+    """Count the formatting a message carries: bold, links, quotes and so on.
+
+    Telegram detects the AUTO_ENTITIES (plain URLs, @mentions, hashtags) by
+    itself, so they are not formatting anybody chose and are not counted.
+    """
+    return Counter(
+        entity_kind(entity)
+        for entity in entities or []
+        if not isinstance(entity, AUTO_ENTITIES)
+        and (custom_emoji or not isinstance(entity, types.MessageEntityCustomEmoji))
+    )
+
+
+async def outgoing_entities(
+    client: TelegramClient,
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    *,
+    keep_custom_emoji: bool = True,
+) -> list[types.TypeMessageEntity]:
+    """Turn the entities Telegram gave us into entities Telegram will accept.
+
+    Received and sent entities are not the same thing. A received user mention
+    is messageEntityMentionName, but a sent one must be the input form carrying
+    an access hash; entities may not run past the text or end in whitespace or
+    a newline. Telegram does not always refuse a message that breaks these
+    rules: it can store the text and drop the formatting instead, which is
+    exactly a markdown post arriving as plain names.
+    """
+    total = utf16_length(text)
+    prepared: list[types.TypeMessageEntity] = []
+    for entity in entities or []:
+        if isinstance(entity, AUTO_ENTITIES):
+            continue  # Telegram re-detects these; sending them adds nothing.
+        if not keep_custom_emoji and isinstance(entity, types.MessageEntityCustomEmoji):
+            continue
+        start = max(0, entity.offset)
+        end = min(total, entity.offset + entity.length)
+        if not isinstance(entity, types.MessageEntityCustomEmoji):
+            # Telegram measures an entity without its trailing whitespace.
+            end = start + utf16_length(_units_text(text, start, end).rstrip())
+        if end <= start:
+            continue
+
+        if isinstance(entity, types.MessageEntityMentionName):
+            try:
+                user = await client.get_input_entity(entity.user_id)
+                fixed: types.TypeMessageEntity = types.InputMessageEntityMentionName(
+                    offset=start, length=end - start, user_id=user
+                )
+            except Exception:  # noqa: BLE001  Unknown user: keep the link anyway.
+                fixed = types.MessageEntityTextUrl(
+                    offset=start, length=end - start, url=f"tg://user?id={entity.user_id}"
+                )
+        else:
+            fixed = copy.copy(entity)
+            fixed.offset = start
+            fixed.length = end - start
+        prepared.append(fixed)
+
+    # Outer entities first, as Telegram itself orders them.
+    prepared.sort(key=lambda item: (item.offset, -item.length))
+    return prepared
+
+
 async def send_clone_batch(
     client: TelegramClient,
     target: types.Channel,
     batch: Sequence[Message],
     medias: Sequence[object],
     id_map: dict[int, int],
-    keep_custom_emoji: bool = True,
+    entity_lists: Sequence[list[types.TypeMessageEntity]],
 ) -> list[Message]:
-    """Publish one cloned post or album, keeping replies pointing correctly."""
+    """Publish one cloned post or album, keeping replies pointing correctly.
+
+    entity_lists holds the prepared outgoing entities of each part, in order.
+    """
     first = batch[0]
     reply_to = None
     replied = replied_message_id(first)
     if replied is not None and replied in id_map:
         reply_to = types.InputReplyToMessage(reply_to_msg_id=id_map[replied])
+    prepared = {message.id: list(entities) for message, entities in zip(batch, entity_lists, strict=True)}
 
     def entities_of(message: Message) -> list[types.TypeMessageEntity]:
-        entities = list(message.entities or [])
-        return entities if keep_custom_emoji else without_custom_emoji(entities)
+        return prepared[message.id]
 
     if len(batch) > 1:
         items = [
@@ -1745,6 +1841,81 @@ class ClonedPost:
     sent: list[Message]
     degraded: bool = False  # Published without its premium emoji.
     reason: str | None = None  # Why it could not be cloned at all.
+    # Formatting Telegram did not keep even after a repair, e.g. "Bold x3".
+    formatting_lost: str = ""
+
+
+def describe_missing(wanted: Counter[str], got: Counter[str]) -> str:
+    """Describe the formatting in wanted that got lacks, e.g. "Bold x3, TextUrl"."""
+    missing = wanted - got
+    return ", ".join(
+        kind if count == 1 else f"{kind} x{count}" for kind, count in sorted(missing.items())
+    )
+
+
+async def keep_formatting(
+    client: TelegramClient,
+    target: types.Channel,
+    number: int,
+    batch: Sequence[Message],
+    sent: Sequence[Message],
+    entity_lists: Sequence[list[types.TypeMessageEntity]],
+    keep_emoji: bool,
+) -> str:
+    """Check Telegram kept each part's formatting, and put it back if not.
+
+    The sent message Telegram returns is what it actually stored, so this is
+    the real result rather than a guess. A part that came back with less
+    formatting than its source is edited with the formatting again, and with
+    plain emoji when premium emoji were the obstacle. Returns what is still
+    missing afterwards, or "" when every part came through.
+    """
+    still_missing: list[str] = []
+    for source_message, new_message, entities in zip(batch, sent, entity_lists, strict=True):
+        wanted = formatting_kinds(source_message.entities, custom_emoji=keep_emoji)
+        got = formatting_kinds(new_message.entities, custom_emoji=keep_emoji)
+        if not wanted - got:
+            continue
+
+        warning(
+            f"Post {number}: Telegram dropped formatting "
+            f"({describe_missing(wanted, got)}); putting it back."
+        )
+        attempts = [entities]
+        plain = without_custom_emoji(entities)
+        if len(plain) != len(entities):
+            attempts.append(plain)
+        repaired = got
+        for attempt in attempts:
+            try:
+                edited = await retry_on_wait(
+                    client.edit_message,
+                    target,
+                    new_message.id,
+                    source_message.message or "",
+                    formatting_entities=attempt,
+                    link_preview=bool(source_message.web_preview),
+                )
+            except errors.MessageNotModifiedError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                warning(f"Post {number}: formatting repair refused: {exc}")
+                continue
+            repaired = formatting_kinds(
+                getattr(edited, "entities", None), custom_emoji=keep_emoji
+            )
+            new_message.entities = getattr(edited, "entities", None)
+            if not wanted - repaired:
+                break
+            await asyncio.sleep(EDIT_DELAY)
+
+        missing = describe_missing(wanted, repaired)
+        if missing:
+            failure(f"Post {number}: formatting still missing after repair: {missing}")
+            still_missing.append(missing)
+        else:
+            success(f"Post {number}: formatting restored.")
+    return "; ".join(still_missing)
 
 
 async def clone_one_post(
@@ -1778,6 +1949,15 @@ async def clone_one_post(
     last_error = "unknown error"
     for label, reupload, keep_emoji in attempts:
         try:
+            entity_lists = [
+                await outgoing_entities(
+                    client,
+                    message.message or "",
+                    message.entities,
+                    keep_custom_emoji=keep_emoji,
+                )
+                for message in batch
+            ]
             if reupload:
                 with tempfile.TemporaryDirectory(prefix="clone-") as temp_dir:
                     medias = [
@@ -1785,12 +1965,12 @@ async def clone_one_post(
                         for message in batch
                     ]
                     sent = await send_clone_batch(
-                        client, target, batch, medias, id_map, keep_emoji
+                        client, target, batch, medias, id_map, entity_lists
                     )
             else:
                 medias = [clone_input_media(message) for message in batch]
                 sent = await send_clone_batch(
-                    client, target, batch, medias, id_map, keep_emoji
+                    client, target, batch, medias, id_map, entity_lists
                 )
         except STALE_MEDIA_ERRORS as exc:
             last_error = type(exc).__name__
@@ -1813,7 +1993,12 @@ async def clone_one_post(
             id_map[batch[0].id] = sent[0].id
         if label != "as is":
             info(f"Post {number} ({ids}) cloned {label}.")
-        return ClonedPost(number, sent, degraded=not keep_emoji)
+        lost = ""
+        if len(sent) == len(batch):
+            lost = await keep_formatting(
+                client, target, number, batch, sent, entity_lists, keep_emoji
+            )
+        return ClonedPost(number, sent, degraded=not keep_emoji, formatting_lost=lost)
 
     failure(f"Post {number} ({ids}) could not be cloned: {last_error}")
     return ClonedPost(number, [], reason=last_error)
@@ -1951,6 +2136,17 @@ async def verify_clone_order(
         )
         if not texts_match and not any(part.id in relinked for part in batch):
             mismatches.append(f"post {number} has different text")
+            continue
+        # Premium emoji are left out: an account without Premium cannot send
+        # them, and that is reported separately as "sent without premium emoji".
+        for part, copy_part in zip(batch, cloned):
+            missing = describe_missing(
+                formatting_kinds(part.entities, custom_emoji=False),
+                formatting_kinds(copy_part.entities, custom_emoji=False),
+            )
+            if missing:
+                mismatches.append(f"post {number} lost formatting ({missing})")
+                break
     return mismatches
 
 
@@ -2063,7 +2259,8 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     try:
         mismatches = await verify_clone_order(client, target, posts, results, relinked)
         order_line = (
-            f"Order check: all {copied} post(s) match the source, 1 to {len(posts)}"
+            f"Order check: all {copied} post(s) match the source, 1 to {len(posts)}, "
+            "formatting included"
             if not mismatches
             else "Order check FAILED: " + "; ".join(mismatches[:5])
         )
@@ -2090,6 +2287,12 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         report += f"\nLinks that could not be edited: {link_failures}"
     if degraded:
         report += f"\nSent without premium emoji: {degraded}"
+    lost_formatting = [result for result in results if result.formatting_lost]
+    if lost_formatting:
+        report += "\nFormatting Telegram would not keep: " + "; ".join(
+            f"post {result.number} ({result.formatting_lost})"
+            for result in lost_formatting[:5]
+        )
     if gaps:
         report += f"\nCould not clone post(s): {', '.join(str(number) for number in gaps)}"
 

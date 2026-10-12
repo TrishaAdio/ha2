@@ -2074,8 +2074,79 @@ async def send_clone_batch(
             reply_to=reply_to,
         )
     result = await retry_on_wait(client, query)
-    sent = client._get_response_message(query, result, target)
+    sent = client._get_response_message(query, result, target) or message_from_short_reply(
+        result, query, target
+    )
     return [sent] if sent else []
+
+
+def message_from_short_reply(result: object, request: object, target: object) -> Message | None:
+    """Rebuild the sent message from Telegram's short "sent" reply.
+
+    For a plain text message Telegram may answer with updateShortSentMessage,
+    which holds only the new id, the date and the entities it kept. Telethon's
+    send_message handles that itself, but _get_response_message, which raw
+    requests need, does not and returns None. The post was published all the
+    same, so treating None as "not sent" made the clone send the markdown post
+    again, up to once per attempt.
+    """
+    if not isinstance(result, types.UpdateShortSentMessage):
+        return None
+    return types.Message(
+        id=result.id,
+        peer_id=utils.get_peer(target),
+        date=result.date,
+        message=getattr(request, "message", "") or "",
+        out=result.out,
+        media=result.media,
+        entities=result.entities,
+        ttl_period=result.ttl_period,
+    )
+
+
+def _same_post(source: Message, copy_message: Message) -> bool:
+    """Return whether a message in the clone is this source part, by kind and text."""
+    return post_kind(source) == post_kind(copy_message) and (
+        (source.message or "").strip() == (copy_message.message or "").strip()
+    )
+
+
+async def find_landed(
+    client: TelegramClient,
+    target: types.Channel,
+    batch: Sequence[Message],
+    after_id: int,
+) -> list[Message]:
+    """Return the copy of batch if it is already in the clone, else [].
+
+    A send can reach Telegram and still look failed here: the reply may not
+    say which message it made, the connection may drop before the answer, or
+    a flood-wait retry may repeat a request that had already gone through.
+    Resending blindly in those cases is what posts a message twice, so every
+    retry first looks at what arrived after the last post known to be there.
+    """
+    found: list[Message] = []
+    async for message in client.iter_messages(target, min_id=after_id, limit=len(batch) + 10):
+        if getattr(message, "action", None) is None:
+            found.append(message)
+    found.sort(key=lambda message: message.id)
+    if len(found) < len(batch):
+        return []
+    landed = found[: len(batch)]
+    if not all(_same_post(part, copy_part) for part, copy_part in zip(batch, landed)):
+        return []
+    # Anything after it that is the same post again is a duplicate from an
+    # earlier attempt: remove it so the clone holds the post exactly once.
+    extra = [
+        message.id
+        for message in found[len(batch):]
+        if any(_same_post(part, message) for part in batch)
+    ]
+    if extra:
+        warning(f"Removing {len(extra)} duplicate message(s) of the same post.")
+        with contextlib.suppress(Exception):
+            await retry_on_wait(client.delete_messages, target, extra)
+    return landed
 
 
 async def reuploaded_media(
@@ -2211,8 +2282,29 @@ async def clone_one_post(
     if premium:
         attempts.append(("re-uploaded without premium emoji", True, False))
 
+    # The newest message of the clone known before this post: whatever arrives
+    # after it can only be this post.
+    after_id = max(id_map.values(), default=0)
+    entity_lists = [list(message.entities or []) for message in batch]
+    kept_emoji = True
+
+    async def already_there() -> list[Message]:
+        """Look for this post in the clone before sending it once more."""
+        try:
+            return await find_landed(client, target, batch, after_id)
+        except Exception as exc:  # noqa: BLE001  An unreadable clone means resend.
+            warning(f"Post {number}: could not check whether it arrived ({exc}).")
+            return []
+
     last_error = "unknown error"
-    for label, reupload, keep_emoji in attempts:
+    sent: list[Message] = []
+    for attempt_number, (label, reupload, keep_emoji) in enumerate(attempts):
+        if attempt_number:
+            sent = await already_there()
+            if sent:
+                info(f"Post {number} ({ids}) had arrived after all; not sending it again.")
+                break
+        kept_emoji = keep_emoji
         try:
             entity_lists = [
                 await outgoing_entities(
@@ -2248,7 +2340,15 @@ async def clone_one_post(
         if not sent:
             last_error = "Telegram returned no message"
             continue
+        if label != "as is":
+            info(f"Post {number} ({ids}) cloned {label}.")
+        break
+    else:
+        # Every attempt looked failed; one may still have gone through.
+        sent = await already_there()
 
+    if sent:
+        keep_emoji = kept_emoji
         sent = sorted(sent, key=lambda message: message.id)
         if len(sent) == len(batch):
             for source_message, new_message in zip(batch, sent, strict=True):
@@ -2256,8 +2356,6 @@ async def clone_one_post(
         else:
             # Zipping lists of different lengths maps replies onto wrong posts.
             id_map[batch[0].id] = sent[0].id
-        if label != "as is":
-            info(f"Post {number} ({ids}) cloned {label}.")
         lost = ""
         if len(sent) == len(batch):
             lost = await keep_formatting(

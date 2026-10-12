@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import copy
 import getpass
+import json
 import os
 import re
 import sys
@@ -1228,9 +1229,185 @@ def rewrite_message_text(
 
 
 async def set_status(event: object, text: str) -> None:
-    """Replace the command message with a progress line, ignoring failures."""
+    """Show a command's progress, ignoring failures.
+
+    A command this account sent is edited in place. A command an admin sent
+    from another account cannot be edited, since nobody may edit someone else's
+    message, so the first status becomes a reply and later ones edit that reply.
+    """
     with contextlib.suppress(Exception):  # Status must never break the command.
-        await event.edit(text)
+        if getattr(event, "out", True):
+            await event.edit(text)
+            return
+        reply = getattr(event, "status_reply", None)
+        if reply is None:
+            event.status_reply = await event.reply(text, link_preview=False)
+            return
+        try:
+            await reply.edit(text, link_preview=False)
+        except errors.MessageNotModifiedError:
+            pass
+
+
+def message_text(event_or_message: object) -> str:
+    """Return the plain text of a NewMessage event or a Message.
+
+    On an event, `.message` is the whole Message object, not its text; reading
+    it as a string is what crashed .login with "'Message' object has no
+    attribute 'strip'". raw_text is the text on both.
+    """
+    text = getattr(event_or_message, "raw_text", None)
+    if isinstance(text, str):
+        return text
+    inner = getattr(event_or_message, "message", None)
+    if isinstance(inner, str):
+        return inner
+    return getattr(inner, "message", None) or ""
+
+
+ADMINS_FILE = Path((os.getenv("COMMAND_ADMINS_FILE") or "command_admins.json").strip())
+COMMAND_PATTERN = r"^\.(\w+)(?:\s+([\s\S]*))?$"
+
+
+class CommandGate:
+    """Decides who may run the dot commands besides this account itself.
+
+    This account can always run them. Admins are other accounts allowed to send
+    the same commands to it, for example by private message. They come from
+    two places: COMMAND_ADMINS in .env (ids or @usernames, read-only) and
+    .allow / .deny, saved in command_admins.json. Only this account itself can
+    change the list, so an admin can never let further people in.
+    """
+
+    def __init__(self, path: Path = ADMINS_FILE) -> None:
+        self.path = path
+        self.saved: dict[int, str] = {}
+        self.from_env: dict[int, str] = {}
+
+    @property
+    def admins(self) -> dict[int, str]:
+        """Return every admin id with a label."""
+        return {**self.from_env, **self.saved}
+
+    async def load(self, client: TelegramClient) -> None:
+        """Read the saved admins and resolve the ones named in .env."""
+        try:
+            raw = json.loads(self.path.read_text("utf-8"))
+            self.saved = {int(key): str(value) for key, value in raw.items()}
+        except FileNotFoundError:
+            self.saved = {}
+        except (OSError, ValueError) as exc:
+            warning(f"{self.path} could not be read ({exc}); starting with no saved admins.")
+            self.saved = {}
+
+        for token in re.split(r"[,\s]+", os.getenv("COMMAND_ADMINS") or ""):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                if token.lstrip("-").isdigit():
+                    self.from_env[int(token)] = token
+                else:
+                    user = await client.get_entity(token)
+                    self.from_env[user.id] = utils.get_display_name(user) or token
+            except Exception as exc:  # noqa: BLE001  One bad entry must not stop startup.
+                warning(f"COMMAND_ADMINS: cannot resolve {token} ({exc}); skipped.")
+
+    def save(self) -> None:
+        """Write the saved admins atomically."""
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(
+            json.dumps({str(key): value for key, value in self.saved.items()}, indent=2),
+            "utf-8",
+        )
+        os.replace(temporary, self.path)
+
+    def allows(self, event: object) -> bool:
+        """Return whether a message's sender may run commands."""
+        if getattr(event, "out", False):
+            return True
+        return getattr(event, "sender_id", None) in self.admins
+
+    async def handle(self, client: TelegramClient, event: object, name: str, args: list[str]) -> bool:
+        """Run .allow, .deny or .admins. Returns False for any other command."""
+        if name not in {"allow", "deny", "admins"}:
+            return False
+        if not getattr(event, "out", False):
+            await set_status(event, "Only the account itself can change who may send commands.")
+            return True
+        if name == "admins":
+            listed = self.admins
+            if not listed:
+                await set_status(
+                    event, "No admins. Reply .allow to someone's message, or .allow @name."
+                )
+                return True
+            lines = [f"Admins ({len(listed)}):"]
+            lines += [
+                f"{label}  {user_id}" + ("  (from .env)" if user_id in self.from_env else "")
+                for user_id, label in listed.items()
+            ]
+            await set_status(event, "\n".join(lines))
+            return True
+
+        user = await self._target_user(client, event, args)
+        if user is None:
+            await set_status(
+                event,
+                f"Usage: reply .{name} to a message from that person, "
+                f"or .{name} @username, or .{name} <user id>",
+            )
+            return True
+        label = utils.get_display_name(user) or str(user.id)
+        if name == "allow":
+            if getattr(user, "is_self", False):
+                await set_status(event, "This account can always run commands.")
+                return True
+            self.saved[user.id] = label
+            self.save()
+            success(f"Allowed {label} ({user.id}) to send commands.")
+            await set_status(event, f"{label} ({user.id}) can now send commands to this account.")
+        else:
+            removed = self.saved.pop(user.id, None) is not None
+            if removed:
+                self.save()
+            note = (
+                " They are still allowed by COMMAND_ADMINS in .env."
+                if user.id in self.from_env
+                else ""
+            )
+            await set_status(
+                event,
+                (f"{label} can no longer send commands." if removed else f"{label} was not an admin.")
+                + note,
+            )
+        return True
+
+    @staticmethod
+    async def _target_user(client: TelegramClient, event: object, args: list[str]) -> object | None:
+        """Return the user a .allow or .deny is about."""
+        if args:
+            token = args[0]
+            try:
+                return await client.get_entity(int(token) if token.lstrip("-").isdigit() else token)
+            except Exception:  # noqa: BLE001
+                return None
+        reply = await event.get_reply_message() if getattr(event, "is_reply", False) else None
+        if reply is not None:
+            with contextlib.suppress(Exception):
+                return await reply.get_sender()
+        chat = await event.get_chat()
+        # In a private chat, .allow with nothing else means the other person.
+        if isinstance(chat, types.User) and not chat.is_self:
+            return chat
+        return None
+
+
+GATE_HELP = (
+    ".allow [@user|id]         let another account send commands here\n"
+    ".deny [@user|id]          take that away\n"
+    ".admins                   list who may send commands"
+)
 
 
 async def command_change(client: TelegramClient, event: object, args: list[str]) -> None:
@@ -1610,12 +1787,22 @@ COMMAND_TRACE_RE = re.compile(
 )
 
 
+# A dot command on its own, as an admin from another account types it. Status
+# lines are only matched on this account's own messages, but a command an
+# admin sent is theirs, so it is matched whoever sent it.
+DOT_COMMAND_RE = re.compile(r"^\.(?:clone|change|help|allow|deny|admins)\b[^\n]*$")
+
+
 def is_command_trace(message: Message) -> bool:
     """Return whether a message is a dot command or a status the bot wrote."""
-    if not getattr(message, "out", False) or message.media is not None:
+    if message.media is not None:
         return False
-    first_line = (message.message or "").strip().split("\n", 1)[0]
-    return bool(COMMAND_TRACE_RE.match(first_line))
+    text = (message.message or "").strip()
+    if DOT_COMMAND_RE.match(text):
+        return True
+    if not getattr(message, "out", False):
+        return False
+    return bool(COMMAND_TRACE_RE.match(text.split("\n", 1)[0]))
 
 
 async def collect_clone_posts(
@@ -2321,20 +2508,39 @@ COMMAND_HELP = (
     ".change @oldname @newname replace only that username\n"
     ".clone [title]            clone this chat, post by post, in order\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"
+    + GATE_HELP + "\n"
     ".help                     show this list"
 )
+
+
+def report_gate(gate: CommandGate) -> None:
+    """Tell the terminal who, besides this account, may send commands."""
+    if gate.admins:
+        labels = ", ".join(f"{label} ({user_id})" for user_id, label in gate.admins.items())
+        info(f"Admins who may also send commands: {labels}")
+    else:
+        info("Only this account may send commands. Use .allow to add another account.")
 
 
 async def run_commands(client: TelegramClient) -> None:
     """Listen for the dot commands until interrupted."""
     busy = asyncio.Lock()
+    gate = CommandGate()
+    await gate.load(client)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(\w+)(?:\s+([\s\S]*))?$"))
+    @client.on(events.NewMessage(pattern=COMMAND_PATTERN, func=gate.allows))
     async def dispatch(event: object) -> None:
         name = (event.pattern_match.group(1) or "").lower()
         raw_args = (event.pattern_match.group(2) or "").strip()
         if name == "help":
             await set_status(event, COMMAND_HELP)
+            return
+        try:
+            if await gate.handle(client, event, name, raw_args.split()):
+                return
+        except Exception as exc:  # noqa: BLE001
+            failure(f".{name} failed: {exc}")
+            await set_status(event, f".{name} failed: {exc}")
             return
         handler = COMMANDS.get(name)
         if handler is None:
@@ -2351,7 +2557,8 @@ async def run_commands(client: TelegramClient) -> None:
 
     print(Fore.YELLOW + Style.BRIGHT + "\n== COMMAND MODE ==")
     print(Fore.WHITE + COMMAND_HELP)
-    info("Send the commands from this account in any chat. Ctrl+C to stop.")
+    report_gate(gate)
+    info("Send the commands from this account, or an admin's, in any chat. Ctrl+C to stop.")
     await client.run_until_disconnected()
 
 

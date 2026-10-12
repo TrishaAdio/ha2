@@ -13,3 +13,7 @@ redirect_state.tmp
 # main.py mode 3: holds the worker account sessions, so never commit it.
 automaker_state.json
 .automaker-*.tmp
+
+# main.py: the accounts allowed to send commands (.allow / .deny).
+command_admins.json
+command_admins.json.tmp

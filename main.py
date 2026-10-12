@@ -1572,20 +1572,50 @@ class ClonePlan:
 
     # Post N of the source is posts[N - 1]: one message, or a whole album.
     posts: list[list[Message]]
-    # Whether the source already carries an index post. It is copied like any
-    # other post, so a second, generated index would only duplicate it.
-    has_index: bool = False
+    # The bot's own command and status messages found in the source, skipped.
+    skipped_traces: int = 0
+
+
+# The first line of every status or report the dot commands write by editing
+# the command message. When .clone runs inside the source those messages are
+# part of its history, and copying them put "Reading <chat>..." in the clone.
+COMMAND_TRACE_RE = re.compile(
+    r"^(?:\.(?:clone|change|help)\b"
+    r"|Commands$"
+    r"|Resolving \S"
+    r"|Reading .+\.\.\.$"
+    r"|Creating private channel "
+    r"|Cloning (?:into |\d+ post\(s\) into )"
+    r"|Cloned \d+(?:/\d+)? post\(s\) into "
+    r"|Repointing links in "
+    r"|Posting the (?:linked )?index"
+    r"|Rewriting .+ to @"
+    r"|Rewrote .+ to @"
+    r"|Still working on the previous command\."
+    r"|Cannot (?:clone|resolve) "
+    r"|That chat cannot be cloned\."
+    r"|\S+ has no posts to clone\."
+    r"|\.\w+ failed: )"
+)
+
+
+def is_command_trace(message: Message) -> bool:
+    """Return whether a message is a dot command or a status the bot wrote."""
+    if not getattr(message, "out", False) or message.media is not None:
+        return False
+    first_line = (message.message or "").strip().split("\n", 1)[0]
+    return bool(COMMAND_TRACE_RE.match(first_line))
 
 
 async def collect_clone_posts(
-    client: TelegramClient, source: ChatEntity
+    client: TelegramClient, source: ChatEntity, command_id: int | None = None
 ) -> ClonePlan:
     """Read and number every source post, oldest first, before sending any.
 
-    Nothing is dropped: every text, markdown, media and sticker post is copied,
-    exactly where it sits. Index detection used to skip posts, and it matched
-    real posts too (any blockquote holding the marker emoji and " | Demo"), so
-    a channel's own long markdown post silently disappeared from the clone.
+    Every text, markdown, media and sticker post is copied exactly where it
+    sits. The only messages left out are service messages and the bot's own
+    command messages: the running .clone (command_id) and the status reports
+    earlier runs left behind when they were started inside the source.
     """
     plan = ClonePlan(posts=[])
     album: list[Message] = []
@@ -1602,8 +1632,9 @@ async def collect_clone_posts(
             continue  # Service messages ("channel created") are not posts.
         if not message.message and message.media is None:
             continue
-        if looks_like_index(message):
-            plan.has_index = True  # Still copied below, in its own place.
+        if message.id == command_id or is_command_trace(message):
+            plan.skipped_traces += 1
+            continue
 
         if message.grouped_id is None:
             flush()
@@ -1788,39 +1819,6 @@ async def clone_one_post(
     return ClonedPost(number, [], reason=last_error)
 
 
-def clone_index_entries(
-    posts: Sequence[Sequence[Message]],
-    results: Sequence[ClonedPost],
-    target: types.Channel,
-) -> list[IndexEntry]:
-    """Build the index lines in source post order.
-
-    Only media posts with a caption title are listed, matching reindex.py. Every
-    entry exists from the start, so a post not cloned yet, or that could not be
-    cloned, is a line without a link rather than a missing line.
-    """
-    entries: list[IndexEntry] = []
-    for number, batch in enumerate(posts, start=1):
-        position = caption_position(batch)
-        if position is None:
-            continue
-        source_message = batch[position]
-        if source_message.media is None or isinstance(
-            source_message.media, types.MessageMediaWebPage
-        ):
-            continue
-        title = index_title(source_message.message)
-        if not title:
-            continue
-        url = None
-        if number <= len(results) and results[number - 1].sent:
-            sent = results[number - 1].sent
-            cloned = sent[position] if position < len(sent) else sent[0]
-            url = message_link(target, cloned.id)
-        entries.append(IndexEntry(title=title, url=url))
-    return entries
-
-
 PHOTO_ACTIONS = (types.MessageActionChatEditPhoto, types.MessageActionChatDeletePhoto)
 
 
@@ -1892,6 +1890,70 @@ async def copy_chat_photo(
     return True
 
 
+def post_kind(message: Message) -> str:
+    """Describe what a message carries, for comparing a clone with its source."""
+    media = message.media
+    if media is None or isinstance(media, types.MessageMediaWebPage):
+        return "text"
+    if message.photo:
+        return "photo"
+    document = getattr(message, "document", None)
+    attributes = getattr(document, "attributes", None) or []
+    if any(isinstance(attribute, types.DocumentAttributeSticker) for attribute in attributes):
+        return "sticker"
+    if document is not None:
+        return "file"
+    return type(media).__name__
+
+
+async def verify_clone_order(
+    client: TelegramClient,
+    target: types.Channel,
+    posts: Sequence[Sequence[Message]],
+    results: Sequence[ClonedPost],
+    relinked: set[int],
+) -> list[str]:
+    """Read the clone back and check its Nth post is the source's Nth post.
+
+    Returns a description of every mismatch; an empty list means the clone
+    holds exactly the source's posts, in order, with nothing extra between.
+    """
+    clone_posts: list[list[Message]] = []
+    async for message in client.iter_messages(target, reverse=True):
+        if message.action is not None:
+            continue
+        if (
+            message.grouped_id is not None
+            and clone_posts
+            and clone_posts[-1][0].grouped_id == message.grouped_id
+        ):
+            clone_posts[-1].append(message)
+        else:
+            clone_posts.append([message])
+
+    expected = [
+        (number, batch)
+        for number, (batch, result) in enumerate(zip(posts, results), start=1)
+        if result.sent
+    ]
+    mismatches: list[str] = []
+    if len(clone_posts) != len(expected):
+        mismatches.append(
+            f"clone has {len(clone_posts)} post(s), expected {len(expected)}"
+        )
+    for (number, batch), cloned in zip(expected, clone_posts):
+        if [post_kind(part) for part in batch] != [post_kind(part) for part in cloned]:
+            mismatches.append(f"post {number} is not the same kind of post")
+            continue
+        texts_match = all(
+            (part.message or "") == (copy_part.message or "")
+            for part, copy_part in zip(batch, cloned)
+        )
+        if not texts_match and not any(part.id in relinked for part in batch):
+            mismatches.append(f"post {number} has different text")
+    return mismatches
+
+
 async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
     """Clone a chat into a fresh private channel.
 
@@ -1899,10 +1961,10 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     chat, by invite link, public link or @handle, clones that chat instead
     and any remaining words become the new title.
 
-    The clone gets the source's profile photo and description, then every post
-    is copied one by one in the source's order, nothing skipped or moved. Once
-    every post exists, links between posts are pointed at the clone. A styled
-    linked index is added at the end only when the source has no index post.
+    The clone is an exact copy: the source's profile photo and description,
+    then every post one by one in the source's order, nothing added, skipped
+    or moved. Once every post exists, links between posts are pointed at the
+    clone, and the clone is read back to prove post N matches source post N.
     """
     title_words = list(args)
     if args and looks_like_chat_reference(args[0]):
@@ -1927,12 +1989,14 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     title = " ".join(title_words).strip() or source_name or "Clone"
     info(f"Reading {source_name}...")
     await set_status(event, f"Reading {source_name}...")
-    plan = await collect_clone_posts(client, source)
+    plan = await collect_clone_posts(client, source, command_id=event.id)
     posts = plan.posts
     if not posts:
         await set_status(event, f"{source_name} has no posts to clone.")
         return
-    info(f"{len(posts)} post(s) to clone, in order.")
+    info(f"{len(posts)} post(s) to clone, one by one in the source's order.")
+    if plan.skipped_traces:
+        info(f"Left out {plan.skipped_traces} bot command/status message(s).")
 
     await set_status(event, f"Creating private channel {title!r}...")
     created = await retry_on_wait(
@@ -1994,17 +2058,18 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     else:
         info("No post carried a link to the source, so none needed repointing.")
 
-    # The source's own index was copied in place above, with its links now
-    # pointing at the clone; a generated one is only added when there is none.
-    final_entries: list[IndexEntry] = []
-    index_ids: list[int | None] = []
-    if plan.has_index:
-        info("The source's own index was copied in place; no extra index added.")
-    else:
-        final_entries = clone_index_entries(posts, results, target)
-        if final_entries:
-            info(f"Posting the linked index for {len(final_entries)} post(s)...")
-            index_ids = await post_index_messages(client, target, None, final_entries)
+    # Read the finished clone back and compare it with the source, post by post.
+    relinked = {message.id for _new_id, message in pending_links}
+    try:
+        mismatches = await verify_clone_order(client, target, posts, results, relinked)
+        order_line = (
+            f"Order check: all {copied} post(s) match the source, 1 to {len(posts)}"
+            if not mismatches
+            else "Order check FAILED: " + "; ".join(mismatches[:5])
+        )
+    except Exception as exc:  # noqa: BLE001
+        order_line = f"Order check could not run: {exc}"
+    (success if order_line.startswith("Order check: all") else failure)(order_line)
 
     exported = await retry_on_wait(
         client,
@@ -2012,15 +2077,11 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     )
     link = getattr(exported, "link", None) or "no link returned"
 
-    index_messages = sum(1 for message_id in index_ids if message_id is not None)
-    report = f"Cloned {copied}/{len(posts)} post(s) into {title!r}\n{link}"
+    report = f"Cloned {copied}/{len(posts)} post(s) into {title!r}\n{link}\n{order_line}"
     if copied_details:
         report += f"\nCopied: {', '.join(copied_details)}"
-    if index_ids:
-        report += (
-            f"\nIndex added at the end: {len(final_entries)} entries "
-            f"in {index_messages} message(s)"
-        )
+    if plan.skipped_traces:
+        report += f"\nLeft out bot command messages: {plan.skipped_traces}"
     if repointed:
         report += f"\nLinks repointed at the clone: {repointed}"
     if untouched:
@@ -2055,7 +2116,7 @@ COMMAND_HELP = (
     "Commands\n"
     ".change @newname          replace every username in every post\n"
     ".change @oldname @newname replace only that username\n"
-    ".clone [title]            clone this chat, with its linked index\n"
+    ".clone [title]            clone this chat, post by post, in order\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"
     ".help                     show this list"
 )

@@ -59,6 +59,24 @@ A Telethon userbot that copies every photo from a selected source chat to a sele
 
 Set `MAIN_MODE=copy`, `MAIN_MODE=commands` or `MAIN_MODE=auto` in `.env` to skip the question.
 
+## Sending commands from another account
+
+Modes 2 and 3 take commands from this account itself, and from **admins**: other accounts allowed to send the same commands to it, typically by private message.
+
+```text
+.allow            # sent by this account in an admin's DM: allows that person
+.allow @someone   # or by @username / user id, from anywhere
+.deny @someone    # takes it away
+.admins           # lists them
+```
+
+- Only this account can run `.allow` and `.deny`, so an admin can never let more people in.
+- Admins can also be listed in `.env` as `COMMAND_ADMINS=123456789,@someone`. Those are read-only; `.allow` adds to `command_admins.json`.
+- A command this account sends is edited in place as before. An admin's command gets a reply, which is then edited with the progress, since nobody can edit someone else's message.
+- Anyone not on the list is ignored without a reply.
+- Run `.login` by **private message**. The code and password are deleted for both sides as soon as they are read. In a group that only works when this account may delete other people's messages, and is reported when it cannot.
+- During an admin's `.login`, only that admin's messages are read as answers, so nobody else in the chat can answer it.
+
 # Commands (`main.py` command mode)
 
 In command mode the script listens for dot commands typed **from your own account** in any chat. Nobody else can trigger them. The command message itself is replaced with live progress, so chats stay clean.

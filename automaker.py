@@ -46,10 +46,15 @@ from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.sessions import StringSession
 
 from main import (
+    COMMAND_PATTERN,
+    GATE_HELP,
+    CommandGate,
     channel_from_updates,
     failure,
     info,
     looks_like_chat_reference,
+    message_text,
+    report_gate,
     resolve_clone_source,
     set_status,
     success,
@@ -347,18 +352,33 @@ class Conversation:
         self.client = client
         self.event = event
         self.chat_id = event.chat_id
+        # Answers are read from whoever started the command: this account, or
+        # an admin messaging it from another account.
+        self.by_self = bool(getattr(event, "out", False))
+        self.sender_id = getattr(event, "sender_id", None)
         self.queue: asyncio.Queue[Any] = asyncio.Queue()
         self._handler: Callable[..., Awaitable[None]] | None = None
 
+    def is_answer(self, event: Any) -> bool:
+        """Return whether a new message is an answer from the right person.
+
+        For an admin's login the status is a reply this account sends into the
+        same chat, so matching on the sender keeps those replies from being
+        read back as answers.
+        """
+        if event.id == self.event.id:
+            return False  # The command message is the prompt, not an answer.
+        if self.by_self:
+            return bool(getattr(event, "out", False))
+        return not getattr(event, "out", False) and event.sender_id == self.sender_id
+
     async def __aenter__(self) -> Conversation:
         async def collect(event: Any) -> None:
-            if event.id == self.event.id:
-                return  # The command message is the prompt, not an answer.
             await self.queue.put(event)
 
         self._handler = collect
         self.client.add_event_handler(
-            collect, events.NewMessage(outgoing=True, chats=self.chat_id)
+            collect, events.NewMessage(chats=self.chat_id, func=self.is_answer)
         )
         return self
 
@@ -381,11 +401,15 @@ class Conversation:
                 f"nothing was sent for {int(ASK_TIMEOUT)}s, so the login stopped"
             ) from exc
 
-        text = (answer.message or "").strip()
+        text = message_text(answer).strip()
         if secret:
             # Read once, then gone: a code or password must not stay readable.
-            with contextlib.suppress(Exception):
-                await self.client.delete_messages(self.chat_id, [answer.id])
+            # In a private chat this removes it for both sides; in a group it
+            # needs the right to delete other people's messages.
+            try:
+                await self.client.delete_messages(self.chat_id, [answer.id], revoke=True)
+            except Exception as exc:  # noqa: BLE001
+                warning(f"Could not delete a login answer ({exc}); delete it by hand.")
         if text.lower() in CANCEL_WORDS:
             raise LoginAborted("cancelled")
         if not text:
@@ -992,6 +1016,7 @@ COMMAND_HELP = (
     ".reset [name|all]      mark workers unused again\n"
     ".remove <name>         forget a worker and its session\n"
     ".cancel                stop a login that is waiting\n"
+    + GATE_HELP + "\n"
     ".help                  show this list"
 )
 
@@ -1013,12 +1038,14 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
     """Listen for the auto-maker commands until interrupted."""
     state = AutoState.load()
     busy = asyncio.Lock()
+    gate = CommandGate()
+    await gate.load(client)
     # While a login is waiting for a phone code, every other command is ignored
     # in that chat: the answers are plain messages and a stray command in the
     # middle of the flow would be read as one of them.
     awaiting: set[int] = set()
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(\w+)(?:\s+([\s\S]*))?$"))
+    @client.on(events.NewMessage(pattern=COMMAND_PATTERN, func=gate.allows))
     async def dispatch(event: Any) -> None:
         name = (event.pattern_match.group(1) or "").lower()
         raw_args = (event.pattern_match.group(2) or "").strip()
@@ -1029,6 +1056,13 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
             return
         if name == "cancel":
             await set_status(event, "Nothing is waiting for an answer.")
+            return
+        try:
+            if await gate.handle(client, event, name, raw_args.split()):
+                return
+        except Exception as exc:  # noqa: BLE001
+            failure(f".{name} failed: {exc}")
+            await set_status(event, f".{name} failed: {exc}")
             return
         handler = COMMANDS.get(name)
         if handler is None:
@@ -1059,6 +1093,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
     info(f"Workers: {free} ready, {used} spent, {aside} set aside")
     info(f"Creates: {state.kind}. Links go to: {state.delivery_title or 'Saved Messages'}")
     if not state.workers:
-        warning("No workers yet. Send .login from this account to add one.")
-    info("Send the commands from this account in any chat. Ctrl+C to stop.")
+        warning("No workers yet. Send .login to add one.")
+    report_gate(gate)
+    info("Send the commands from this account, or an admin's, in any chat. Ctrl+C to stop.")
     await client.run_until_disconnected()

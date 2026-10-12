@@ -1568,15 +1568,13 @@ def clone_input_media(message: Message) -> object | None:
 
 @dataclass
 class ClonePlan:
-    """The numbered posts of a source, and where its own index sat."""
+    """Every post of a source, numbered in the source's own order."""
 
     # Post N of the source is posts[N - 1]: one message, or a whole album.
     posts: list[list[Message]]
-    # How many posts came before the source's own index, so the clone puts its
-    # index back in the same place. None means the source had none: the end.
-    index_after: int | None = None
-    # The source's own index sticker, with a fresh file reference.
-    index_sticker: object | None = None
+    # Whether the source already carries an index post. It is copied like any
+    # other post, so a second, generated index would only duplicate it.
+    has_index: bool = False
 
 
 async def collect_clone_posts(
@@ -1584,11 +1582,10 @@ async def collect_clone_posts(
 ) -> ClonePlan:
     """Read and number every source post, oldest first, before sending any.
 
-    Numbering up front is what keeps the order honest: once a post owns its
-    number, a later failure cannot hand that number to the next post.
-
-    The source's own index is not copied, because it links back at the source,
-    but its position is recorded so the clone's index lands after the same post.
+    Nothing is dropped: every text, markdown, media and sticker post is copied,
+    exactly where it sits. Index detection used to skip posts, and it matched
+    real posts too (any blockquote holding the marker emoji and " | Demo"), so
+    a channel's own long markdown post silently disappeared from the clone.
     """
     plan = ClonePlan(posts=[])
     album: list[Message] = []
@@ -1602,17 +1599,11 @@ async def collect_clone_posts(
 
     async for message in client.iter_messages(source, reverse=True):
         if message.action is not None:
-            continue
+            continue  # Service messages ("channel created") are not posts.
         if not message.message and message.media is None:
             continue
-        if is_index_sticker(message) or looks_like_index(message):
-            flush()
-            if plan.index_after is None:
-                plan.index_after = len(plan.posts)
-            if plan.index_sticker is None and is_index_sticker(message):
-                with contextlib.suppress(Exception):
-                    plan.index_sticker = clone_input_media(message)
-            continue
+        if looks_like_index(message):
+            plan.has_index = True  # Still copied below, in its own place.
 
         if message.grouped_id is None:
             flush()
@@ -1830,54 +1821,6 @@ def clone_index_entries(
     return entries
 
 
-def chunk_urls(chunk: tuple[str, list[types.TypeMessageEntity]]) -> list[str]:
-    """Return the links one index chunk carries, in order."""
-    return [
-        entity.url
-        for entity in chunk[1]
-        if isinstance(entity, types.MessageEntityTextUrl)
-    ]
-
-
-async def refresh_clone_index(
-    client: TelegramClient,
-    target: types.Channel,
-    message_ids: Sequence[int | None],
-    posted: Sequence[IndexEntry],
-    final: Sequence[IndexEntry],
-) -> int:
-    """Edit an index posted mid-clone so every line links to its finished post.
-
-    Both layouts reserve room for every link, so chunk N of the final index is
-    exactly the text of index message N; only the links differ.
-    """
-    before = list(make_index_messages(posted, reserve_links=True))
-    after = list(make_index_messages(final, reserve_links=True))
-    updated = 0
-    for message_id, old, new in zip(message_ids, before, after, strict=False):
-        if message_id is None or chunk_urls(old) == chunk_urls(new):
-            continue
-        text, entities = new
-        for attempt in (entities, without_custom_emoji(entities)):
-            try:
-                await retry_on_wait(
-                    client.edit_message,
-                    target,
-                    message_id,
-                    text,
-                    formatting_entities=list(attempt),
-                    link_preview=False,
-                )
-                updated += 1
-                break
-            except errors.MessageNotModifiedError:
-                break
-            except Exception as exc:  # noqa: BLE001
-                warning(f"Could not fill in index message {message_id}: {exc}")
-        await asyncio.sleep(EDIT_DELAY)
-    return updated
-
-
 PHOTO_ACTIONS = (types.MessageActionChatEditPhoto, types.MessageActionChatDeletePhoto)
 
 
@@ -1956,10 +1899,10 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     chat, by invite link, public link or @handle, clones that chat instead
     and any remaining words become the new title.
 
-    The clone gets the source's profile photo and description. Every post is
-    numbered before anything is sent, the styled linked index goes after the
-    same post the source keeps its own index after, and once every post exists
-    the index and the links between posts are pointed at the clone.
+    The clone gets the source's profile photo and description, then every post
+    is copied one by one in the source's order, nothing skipped or moved. Once
+    every post exists, links between posts are pointed at the clone. A styled
+    linked index is added at the end only when the source has no index post.
     """
     title_words = list(args)
     if args and looks_like_chat_reference(args[0]):
@@ -1989,14 +1932,7 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     if not posts:
         await set_status(event, f"{source_name} has no posts to clone.")
         return
-    # The index goes after this many posts; with no index in the source, last.
-    index_after = len(posts) if plan.index_after is None else plan.index_after
-    where = (
-        f"after post {index_after}, as in the source"
-        if plan.index_after is not None
-        else "at the end"
-    )
-    info(f"{len(posts)} post(s) to clone; the index goes {where}.")
+    info(f"{len(posts)} post(s) to clone, in order.")
 
     await set_status(event, f"Creating private channel {title!r}...")
     created = await retry_on_wait(
@@ -2030,30 +1966,9 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     )
     pending_links: list[tuple[int, Message]] = []
     results: list[ClonedPost] = []
-    index_ids: list[int | None] = []
-    index_posted: list[IndexEntry] = []
     await set_status(event, f"Cloning {len(posts)} post(s) into {title!r}...")
 
-    async def place_index() -> None:
-        """Post the index here, linking whatever already exists."""
-        nonlocal index_ids, index_posted
-        index_posted = clone_index_entries(posts, results, target)
-        if not index_posted:
-            return
-        info(f"Posting the index after post {len(results)}...")
-        index_ids = await post_index_messages(
-            client,
-            target,
-            None,
-            index_posted,
-            sticker=plan.index_sticker,
-            reserve_links=True,
-        )
-        await asyncio.sleep(CLONE_DELAY)
-
     for number, batch in enumerate(posts, start=1):
-        if len(results) == index_after:
-            await place_index()
         result = await clone_one_post(client, target, number, batch, id_map)
         results.append(result)
         for source_message, new_message in zip(batch, result.sent, strict=False):
@@ -2062,21 +1977,11 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         if number % STATUS_EVERY == 0:
             await set_status(event, f"Cloning into {title!r}... {number}/{len(posts)}")
         await asyncio.sleep(CLONE_DELAY)
-    if len(results) == index_after:
-        await place_index()
 
     gaps = [result.number for result in results if not result.sent]
     degraded = sum(1 for result in results if result.degraded)
     copied = len(posts) - len(gaps)
-
-    # Lines for posts after the index went out unlinked; link them now.
-    final_entries = clone_index_entries(posts, results, target)
-    if index_ids:
-        filled = await refresh_clone_index(
-            client, target, index_ids, index_posted, final_entries
-        )
-        if filled:
-            success(f"Filled in links in {filled} index message(s).")
+    success(f"Copied {copied}/{len(posts)} post(s) in the source's order.")
 
     repointed = untouched = link_failures = 0
     if pending_links:
@@ -2088,6 +1993,18 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         success(f"Repointed links in {repointed} post(s).")
     else:
         info("No post carried a link to the source, so none needed repointing.")
+
+    # The source's own index was copied in place above, with its links now
+    # pointing at the clone; a generated one is only added when there is none.
+    final_entries: list[IndexEntry] = []
+    index_ids: list[int | None] = []
+    if plan.has_index:
+        info("The source's own index was copied in place; no extra index added.")
+    else:
+        final_entries = clone_index_entries(posts, results, target)
+        if final_entries:
+            info(f"Posting the linked index for {len(final_entries)} post(s)...")
+            index_ids = await post_index_messages(client, target, None, final_entries)
 
     exported = await retry_on_wait(
         client,
@@ -2101,8 +2018,8 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         report += f"\nCopied: {', '.join(copied_details)}"
     if index_ids:
         report += (
-            f"\nIndex: {len(final_entries)} entries in {index_messages} message(s), "
-            f"after post {index_after}"
+            f"\nIndex added at the end: {len(final_entries)} entries "
+            f"in {index_messages} message(s)"
         )
     if repointed:
         report += f"\nLinks repointed at the clone: {repointed}"

@@ -117,9 +117,9 @@ Public handles and links need no join, since public history is readable without 
 Expired and invalid invites are reported and nothing is created.
 
 - The clone gets the source's **profile photo** and **description**. The "channel photo updated" service message Telegram adds is deleted.
-- Every post is copied oldest first: text, photos, albums, documents, captions, formatting entities and spoilers.
+- **Every post is copied one by one, in the source's exact order**: text, long markdown posts, photos, albums, documents, stickers, captions, formatting entities and spoilers. Nothing is skipped or moved, including the source's own index post, which stays where it was.
 - **Post numbering holds.** Every source post is numbered before anything is sent. A post Telegram refuses is retried without its premium emoji, then re-uploaded, so it keeps its place; one that still fails is reported by number instead of silently shifting every later post up.
-- **The index goes where the source keeps its own.** If the source's index sits after post 40, the clone's index goes after post 40 too, and the posts after it keep going below. Lines for those later posts are posted unlinked and filled in once they exist. With no index in the source, it goes at the end.
+- **The index:** a source that has its own index post keeps it, copied in place, with its links repointed at the clone. No second index is added. A source with no index gets a styled linked index at the end.
 - Replies are remapped, so a reply in the clone points at the copy of the message it originally answered.
 - **Links between posts are repointed at the clone.** A post linking to `t.me/srcchan/45` ends up linking to the cloned copy of post 45 instead of back at the source. This covers both plain links in the text and markdown-style hyperlinks, where only the target changes and the visible text is left exactly as it was.
 - Media is reused by file reference, so nothing is downloaded in the normal case. Expired references fall back to a download and re-upload.
@@ -546,7 +546,7 @@ Everything worked.
 
 ## Post numbering, and why this is not `main.py`'s `.clone`
 
-`main.py`'s `.clone` now numbers posts up front, retries refused posts, reports gaps by number, and puts the index where the source keeps it. `redirect.py` goes further: it rotates channels on a timer, copies the pin and content protection, handles dividers, and lists every post in the index (with an optional caption filter) rather than only media posts with a caption title.
+`main.py`'s `.clone` now numbers posts up front, retries refused posts, reports gaps by number, and copies every post in place, the source's own index included. `redirect.py` goes further: it rotates channels on a timer, copies the pin and content protection, handles dividers, and lists every post in the index (with an optional caption filter) rather than only media posts with a caption title.
 
 `redirect.py` treats the post number as a real value:
 

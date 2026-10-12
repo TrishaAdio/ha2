@@ -17,7 +17,6 @@ import os
 import re
 import sys
 import tempfile
-from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1596,7 +1595,6 @@ async def repoint_clone_links(
 
         new_text, new_entities = result
         new_entities = await outgoing_entities(client, new_text, new_entities)
-        wanted = formatting_kinds(new_entities, custom_emoji=False)
         # Premium emoji first; a post cloned without them is edited without them.
         attempts = [new_entities]
         plain = without_custom_emoji(new_entities)
@@ -1613,13 +1611,21 @@ async def repoint_clone_links(
                     formatting_entities=entities,
                     link_preview=bool(source_message.web_preview),
                 )
-                got = formatting_kinds(getattr(edited, "entities", None), custom_emoji=False)
-                if edited is not None and wanted - got:
+                missing = (
+                    formatting_lost(
+                        new_text,
+                        new_entities,
+                        getattr(edited, "message", None) or new_text,
+                        getattr(edited, "entities", None),
+                        custom_emoji=False,
+                    )
+                    if edited is not None
+                    else ""
+                )
+                if missing:
                     # Telegram took the new links but not all the formatting:
                     # try the next form instead of calling this a success.
-                    last_error = RuntimeError(
-                        f"Telegram dropped {describe_missing(wanted, got)}"
-                    )
+                    last_error = RuntimeError(f"Telegram dropped {missing}")
                     continue
                 repointed += 1
                 last_error = None
@@ -1867,20 +1873,93 @@ def entity_kind(entity: types.TypeMessageEntity) -> str:
     return type(entity).__name__.removeprefix("MessageEntity")
 
 
-def formatting_kinds(
-    entities: Sequence[types.TypeMessageEntity] | None, *, custom_emoji: bool = True
-) -> Counter[str]:
-    """Count the formatting a message carries: bold, links, quotes and so on.
+def _visible_units(text: str) -> set[int]:
+    """Return the UTF-16 positions of the characters that are not whitespace."""
+    visible: set[int] = set()
+    position = 0
+    for character in text:
+        width = 2 if ord(character) > 0xFFFF else 1
+        if not character.isspace():
+            visible.update(range(position, position + width))
+        position += width
+    return visible
 
-    Telegram detects the AUTO_ENTITIES (plain URLs, @mentions, hashtags) by
-    itself, so they are not formatting anybody chose and are not counted.
+
+def formatting_coverage(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    *,
+    custom_emoji: bool = True,
+) -> dict[str, set[int]]:
+    """Map each kind of formatting to the visible characters it covers.
+
+    This is what a reader actually sees, which counting entities is not.
+    Telegram stores the same look in different ways: it merges two touching
+    bold spans into one, drops a duplicate, and drops formatting that covers
+    only spaces or blank lines. Each of those changes the entity count while
+    the post looks exactly the same, which is how an order check came to
+    report "post 39 lost formatting (Bold)" for a post that had lost nothing.
     """
-    return Counter(
-        entity_kind(entity)
-        for entity in entities or []
-        if not isinstance(entity, AUTO_ENTITIES)
-        and (custom_emoji or not isinstance(entity, types.MessageEntityCustomEmoji))
-    )
+    visible = _visible_units(text)
+    coverage: dict[str, set[int]] = {}
+    for entity in entities or []:
+        if isinstance(entity, AUTO_ENTITIES):
+            continue
+        if not custom_emoji and isinstance(entity, types.MessageEntityCustomEmoji):
+            continue
+        span = set(range(entity.offset, entity.offset + entity.length)) & visible
+        if span:
+            coverage.setdefault(entity_kind(entity), set()).update(span)
+    return coverage
+
+
+def _runs(units: set[int]) -> list[tuple[int, int]]:
+    """Split positions into contiguous runs, as (start, end) pairs."""
+    runs: list[tuple[int, int]] = []
+    for unit in sorted(units):
+        if runs and unit == runs[-1][1]:
+            runs[-1] = (runs[-1][0], unit + 1)
+        else:
+            runs.append((unit, unit + 1))
+    return runs
+
+
+def formatting_lost(
+    source_text: str,
+    source_entities: Sequence[types.TypeMessageEntity] | None,
+    copy_text: str,
+    copy_entities: Sequence[types.TypeMessageEntity] | None,
+    *,
+    custom_emoji: bool = True,
+) -> str:
+    """Describe the formatting a reader would see missing from the copy.
+
+    Returns "" when the copy looks the same, otherwise something like
+    'Bold on "Price list"' naming the exact text that lost it, so a report
+    says what to look at instead of just a kind. When the copy's text differs,
+    as it does after plain-text links were repointed, positions no longer line
+    up, so the comparison falls back to the number of formatted runs.
+    """
+    want = formatting_coverage(source_text, source_entities, custom_emoji=custom_emoji)
+    have = formatting_coverage(copy_text, copy_entities, custom_emoji=custom_emoji)
+    problems: list[str] = []
+    if source_text == copy_text:
+        for kind in sorted(want):
+            missing = want[kind] - have.get(kind, set())
+            if not missing:
+                continue
+            snippet = " ".join(
+                _units_text(source_text, min(missing), max(missing) + 1).split()
+            )
+            if len(snippet) > 40:
+                snippet = snippet[:39] + "…"
+            problems.append(f'{kind} on "{snippet}"')
+    else:
+        for kind in sorted(want):
+            lost = len(_runs(want[kind])) - len(_runs(have.get(kind, set())))
+            if lost > 0:
+                problems.append(kind if lost == 1 else f"{kind} x{lost}")
+    return ", ".join(problems)
 
 
 async def outgoing_entities(
@@ -2035,14 +2114,6 @@ class ClonedPost:
     formatting_lost: str = ""
 
 
-def describe_missing(wanted: Counter[str], got: Counter[str]) -> str:
-    """Describe the formatting in wanted that got lacks, e.g. "Bold x3, TextUrl"."""
-    missing = wanted - got
-    return ", ".join(
-        kind if count == 1 else f"{kind} x{count}" for kind, count in sorted(missing.items())
-    )
-
-
 async def keep_formatting(
     client: TelegramClient,
     target: types.Channel,
@@ -2062,20 +2133,26 @@ async def keep_formatting(
     """
     still_missing: list[str] = []
     for source_message, new_message, entities in zip(batch, sent, entity_lists, strict=True):
-        wanted = formatting_kinds(source_message.entities, custom_emoji=keep_emoji)
-        got = formatting_kinds(new_message.entities, custom_emoji=keep_emoji)
-        if not wanted - got:
+        source_text = source_message.message or ""
+
+        def lost_in(message: Message) -> str:
+            return formatting_lost(
+                source_text,
+                source_message.entities,
+                getattr(message, "message", None) or "",
+                getattr(message, "entities", None),
+                custom_emoji=keep_emoji,
+            )
+
+        missing = lost_in(new_message)
+        if not missing:
             continue
 
-        warning(
-            f"Post {number}: Telegram dropped formatting "
-            f"({describe_missing(wanted, got)}); putting it back."
-        )
+        warning(f"Post {number}: Telegram dropped {missing}; putting it back.")
         attempts = [entities]
         plain = without_custom_emoji(entities)
         if len(plain) != len(entities):
             attempts.append(plain)
-        repaired = got
         for attempt in attempts:
             try:
                 edited = await retry_on_wait(
@@ -2091,15 +2168,13 @@ async def keep_formatting(
             except Exception as exc:  # noqa: BLE001
                 warning(f"Post {number}: formatting repair refused: {exc}")
                 continue
-            repaired = formatting_kinds(
-                getattr(edited, "entities", None), custom_emoji=keep_emoji
-            )
-            new_message.entities = getattr(edited, "entities", None)
-            if not wanted - repaired:
+            if edited is not None:
+                new_message.entities = getattr(edited, "entities", None)
+                missing = lost_in(edited)
+            if not missing:
                 break
             await asyncio.sleep(EDIT_DELAY)
 
-        missing = describe_missing(wanted, repaired)
         if missing:
             failure(f"Post {number}: formatting still missing after repair: {missing}")
             still_missing.append(missing)
@@ -2330,12 +2405,15 @@ async def verify_clone_order(
         # Premium emoji are left out: an account without Premium cannot send
         # them, and that is reported separately as "sent without premium emoji".
         for part, copy_part in zip(batch, cloned):
-            missing = describe_missing(
-                formatting_kinds(part.entities, custom_emoji=False),
-                formatting_kinds(copy_part.entities, custom_emoji=False),
+            missing = formatting_lost(
+                part.message or "",
+                part.entities,
+                copy_part.message or "",
+                copy_part.entities,
+                custom_emoji=False,
             )
             if missing:
-                mismatches.append(f"post {number} lost formatting ({missing})")
+                mismatches.append(f"post {number} lost {missing}")
                 break
     return mismatches
 

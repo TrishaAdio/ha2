@@ -9,3 +9,7 @@ __pycache__/
 redirect_state.json
 redirect_state.tmp
 *.log
+
+# main.py mode 3: holds the worker account sessions, so never commit it.
+automaker_state.json
+.automaker-*.tmp

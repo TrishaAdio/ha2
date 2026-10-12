@@ -1,24 +1,27 @@
-"""Create group chats through a pool of worker accounts, on command.
+"""Make fresh copies of a demo channel through a pool of worker accounts.
 
-This is main.py's mode 3. The signed-in account is the operator: it listens for
-dot commands, holds the worker sessions, joins every chat the workers create,
-and publishes the invite link where the owner or staff can see it.
+This is main.py's mode 3. The signed-in (premium) account is the operator.
 
-    .set                      publish the links in this chat
+    .set [link]               choose the demo channel that .gen copies
     .login [phone]            add a worker account, by phone, code and 2FA
-    .gen [count] [title]      make a chat with an unused worker, hand over a link
+    .gen [count]              make that many copies of the demo channel
     .accounts                 list the workers and which ones are spent
-    .kind group|channel       what .gen creates
-    .title <template>         title for new chats, {n} is a counter
     .reset [name|all]         mark workers unused again
     .remove <name>            forget a worker and its session
     .cancel                   abort a login that is waiting for an answer
     .help                     show the list
 
-The split of work is deliberate. A worker account creates the chat, so the
-operator's own account never owns anything and never spends its own creation
-quota; the operator is promoted to admin in every chat and is the account that
-exports the delivered link, because it is the one that stays alive.
+One .gen is one copy. A random unused worker creates an empty channel of the
+same kind and name as the demo channel, the operator joins it and is promoted
+to admin, and from then on the operator does every write: profile photo,
+description, every post in order with its formatting, the pinned post and
+content protection, exactly as main.py's .clone does. Nothing is ever posted in
+the demo channel itself. The invite link goes back to whoever typed .gen.
+
+The split of work is deliberate. The worker spends its own channel-creation
+quota, so the operator's account never runs out; the operator posts, so
+premium emoji and formatting come through; and the delivered invite link is
+the operator's own, because a link dies with the account that made it.
 
 Codes and passwords typed into a chat are deleted the moment they are read, and
 no credential is ever written to the terminal or the log. The sessions
@@ -48,10 +51,14 @@ from telethon.sessions import StringSession
 from main import (
     COMMAND_PATTERN,
     GATE_HELP,
+    ClonePlan,
     CommandGate,
     channel_from_updates,
+    clone_into,
+    collect_clone_posts,
     failure,
     info,
+    is_supported_chat,
     looks_like_chat_reference,
     message_text,
     report_gate,
@@ -67,9 +74,9 @@ ASK_TIMEOUT = float(os.getenv("AUTOMAKER_ASK_TIMEOUT") or 300)
 # A flood wait longer than this is not waited out: the worker is set aside and
 # the next one is tried instead, which is the whole point of having a pool.
 MAX_WAIT = float(os.getenv("AUTOMAKER_MAX_WAIT") or 300)
-# Pause between two chats in one .gen run, so a batch does not look automated.
+# Pause between two copies in one .gen run, so a batch does not look automated.
 GEN_DELAY = float(os.getenv("AUTOMAKER_GEN_DELAY") or 8)
-DEFAULT_TITLE = (os.getenv("AUTOMAKER_TITLE") or "Demo {n}").strip() or "Demo {n}"
+GEN_LIMIT = 20  # Most copies one .gen may make.
 CODE_ATTEMPTS = 3
 PASSWORD_ATTEMPTS = 3
 
@@ -94,6 +101,14 @@ class LoginAborted(Exception):
 
 class WorkerUnusable(Exception):
     """This worker cannot make a chat now, so .gen should try another one."""
+
+
+class OperatorBlocked(Exception):
+    """The operator itself cannot join or run the copy.
+
+    Not the worker's fault, and trying the next worker would fail the same way
+    while burning its channel quota too, so .gen stops instead.
+    """
 
 
 def now_stamp() -> str:
@@ -132,42 +147,52 @@ def supported_rights(**wanted: bool) -> types.ChatAdminRights:
     )
 
 
-def operator_rights() -> types.ChatAdminRights:
+def operator_rights(megagroup: bool) -> types.ChatAdminRights:
     """Return the rights the operator account is promoted with.
 
-    Everything except add_admins: the operator has to be able to run the other
-    commands in the chat, but a promoted account that can promote further
-    accounts is a wider hole than this needs to open.
+    Channels and groups take different sets, the way the official apps offer
+    them: posting and editing exist only in broadcast channels, banning and
+    pinning only in groups, and Telegram can refuse a promotion that mixes the
+    two. The copy needs change_info for the photo, description and content
+    protection, post and edit rights for the posts and their links, and delete
+    rights to remove service messages. add_admins is never given, so the
+    operator cannot promote anyone else.
     """
+    if megagroup:
+        return supported_rights(
+            change_info=True,
+            delete_messages=True,
+            ban_users=True,
+            invite_users=True,
+            pin_messages=True,
+            manage_call=True,
+            other=True,
+        )
     return supported_rights(
         change_info=True,
         post_messages=True,
         edit_messages=True,
         delete_messages=True,
-        ban_users=True,
         invite_users=True,
-        pin_messages=True,
         manage_call=True,
-        manage_topics=True,
         post_stories=True,
         edit_stories=True,
         delete_stories=True,
         other=True,
-        add_admins=False,
-        anonymous=False,
     )
 
 
 @dataclass
 class MadeChat:
-    """One chat a worker created, and the link handed to the staff."""
+    """One copy of the demo channel, and the link handed over."""
 
     chat_id: int
     title: str
     link: str
     worker: str
-    kind: str
-    promoted: bool
+    copied: int
+    total: int
+    report: list[str] = field(default_factory=list)
     made_at: str = field(default_factory=now_stamp)
 
     def to_json(self) -> dict[str, Any]:
@@ -177,8 +202,8 @@ class MadeChat:
             "title": self.title,
             "link": self.link,
             "worker": self.worker,
-            "kind": self.kind,
-            "promoted": self.promoted,
+            "copied": self.copied,
+            "total": self.total,
             "made_at": self.made_at,
         }
 
@@ -238,11 +263,9 @@ class AutoState:
 
     path: Path
     workers: list[Worker] = field(default_factory=list)
-    delivery_id: int | None = None
-    delivery_title: str = ""
-    kind: str = "group"
-    title_template: str = DEFAULT_TITLE
-    counter: int = 0
+    # The demo channel .gen copies, by its marked peer id, and its name.
+    source_id: int | None = None
+    source_title: str = ""
 
     @classmethod
     def load(cls, path: str | Path = STATE_FILE) -> AutoState:
@@ -257,13 +280,12 @@ class AutoState:
             raise RuntimeError(f"{state.path} could not be read ({exc})") from exc
 
         state.workers = [Worker.from_json(item) for item in raw.get("workers") or []]
-        delivery = raw.get("delivery") or {}
-        chat_id = delivery.get("chat_id")
-        state.delivery_id = int(chat_id) if chat_id is not None else None
-        state.delivery_title = str(delivery.get("title") or "")
-        state.kind = "channel" if raw.get("kind") == "channel" else "group"
-        state.title_template = str(raw.get("title_template") or DEFAULT_TITLE)
-        state.counter = int(raw.get("counter") or 0)
+        # Keys an older version wrote (delivery, kind, title_template) are
+        # ignored; the workers and their sessions carry over untouched.
+        source = raw.get("source") or {}
+        chat_id = source.get("chat_id")
+        state.source_id = int(chat_id) if chat_id is not None else None
+        state.source_title = str(source.get("title") or "")
         return state
 
     def save(self) -> None:
@@ -275,10 +297,7 @@ class AutoState:
         """
         payload = {
             "workers": [worker.to_json() for worker in self.workers],
-            "delivery": {"chat_id": self.delivery_id, "title": self.delivery_title},
-            "kind": self.kind,
-            "title_template": self.title_template,
-            "counter": self.counter,
+            "source": {"chat_id": self.source_id, "title": self.source_title},
         }
         directory = self.path.parent if str(self.path.parent) else Path(".")
         directory.mkdir(parents=True, exist_ok=True)
@@ -310,15 +329,6 @@ class AutoState:
         while f"w{number}" in taken:
             number += 1
         return f"w{number}"
-
-    def next_title(self) -> str:
-        """Render the title template, advancing its counter."""
-        self.counter += 1
-        try:
-            return self.title_template.format(n=self.counter) or f"Chat {self.counter}"
-        except (IndexError, KeyError, ValueError):
-            # A template with a stray brace must not break a whole .gen run.
-            return f"{self.title_template} {self.counter}".strip()
 
     def pick(self) -> Worker | None:
         """Return a random worker that has not made a chat yet.
@@ -468,32 +478,47 @@ async def worker_client(
 
 
 async def create_chat(
-    client: TelegramClient, title: str, kind: str
+    client: TelegramClient, title: str, megagroup: bool
 ) -> types.Channel:
-    """Create the supergroup, or broadcast channel, a .gen hands over."""
+    """Create the empty channel, or group, that becomes a copy."""
     request = functions.channels.CreateChannelRequest(
         title=title,
         about="",
-        megagroup=kind == "group",
-        broadcast=kind == "channel",
+        megagroup=megagroup,
+        broadcast=not megagroup,
     )
     try:
-        created = await bounded(client, request, label="create a chat")
+        created = await bounded(client, request, label="create a channel")
     except errors.ChannelsTooMuchError as exc:
-        raise WorkerUnusable("it has created as many chats as Telegram allows") from exc
+        raise WorkerUnusable("it has created as many channels as Telegram allows") from exc
     except DEAD_SESSION_ERRORS as exc:
         raise WorkerUnusable(f"its session died ({type(exc).__name__})") from exc
+    except errors.UserRestrictedError as exc:
+        raise WorkerUnusable("Telegram restricts this account (spam limit)") from exc
     return channel_from_updates(created)
+
+
+async def delete_chat(client: TelegramClient, channel: types.Channel) -> None:
+    """Remove a half-made copy, so a failed .gen leaves nothing behind."""
+    try:
+        await client(functions.channels.DeleteChannelRequest(channel=channel))
+        info(f"Deleted the unfinished channel {channel.title!r}.")
+    except Exception as exc:  # noqa: BLE001
+        warning(f"Could not delete the unfinished channel {channel.title!r}: {exc}")
 
 
 async def operator_joins(
     worker: TelegramClient, operator: TelegramClient, channel: types.Channel
-) -> str:
-    """Let the operator into the new chat, and return the link it used.
+) -> types.Channel:
+    """Let the operator into the new channel, and return it as the operator sees it.
 
     The operator joins by invite link rather than being added by the worker:
-    adding needs the two accounts to pass each other's privacy settings, while
-    a link the worker just made always works.
+    adding depends on both accounts' privacy settings, a fresh link does not.
+
+    The channel the worker holds cannot simply be handed over. Telegram gives
+    every account its own access hash for the same channel, so a request the
+    operator makes with the worker's copy is refused; the operator's own copy
+    comes back from the join itself.
     """
     exported = await bounded(
         worker,
@@ -502,27 +527,41 @@ async def operator_joins(
     )
     link = getattr(exported, "link", None)
     if not link:
-        raise RuntimeError("Telegram returned no invite link for the new chat")
+        raise RuntimeError("Telegram returned no invite link for the new channel")
+    invite = invite_hash_of(link)
 
     try:
-        await bounded(
+        joined = await bounded(
             operator,
-            functions.messages.ImportChatInviteRequest(hash=invite_hash_of(link)),
-            label="join the new chat",
+            functions.messages.ImportChatInviteRequest(hash=invite),
+            label="join the new channel",
         )
+        return channel_from_updates(joined)
     except errors.UserAlreadyParticipantError:
-        pass  # Already in: nothing to do, and not a failure.
-    return link
+        checked = await operator(functions.messages.CheckChatInviteRequest(hash=invite))
+        existing = getattr(checked, "chat", None)
+        if isinstance(existing, types.Channel):
+            return existing
+        raise OperatorBlocked("joined, but the channel could not be read back") from None
+    except errors.ChannelsTooMuchError as exc:
+        raise OperatorBlocked(
+            "your account is in as many channels as Telegram allows; leave some"
+        ) from exc
+    except WorkerUnusable as exc:
+        # A long flood wait on the operator is the operator's problem, not
+        # the worker's, and every other worker would hit it too.
+        raise OperatorBlocked(str(exc)) from exc
 
 
 async def promote_operator(
     worker: TelegramClient, channel: types.Channel, operator_id: int
-) -> bool:
-    """Make the operator an admin, reporting whether it worked.
+) -> None:
+    """Make the operator an admin with every right the copy needs.
 
     The worker has to learn the operator's access hash before it can name it in
     a request, and reading the member list is what teaches it: the operator has
-    just joined, so it is in there.
+    just joined, so it is in there. Without admin rights the operator could not
+    post a single message, so a failure here stops the copy.
     """
     participants = await bounded(
         worker,
@@ -544,8 +583,7 @@ async def promote_operator(
         None,
     )
     if found is None:
-        warning("The operator is not in the member list yet, so it stays a member.")
-        return False
+        raise OperatorBlocked("the worker cannot see your account among the members")
 
     try:
         await bounded(
@@ -555,101 +593,126 @@ async def promote_operator(
                 user_id=types.InputUser(
                     user_id=found.id, access_hash=found.access_hash or 0
                 ),
-                admin_rights=operator_rights(),
-                rank="staff",
+                admin_rights=operator_rights(bool(channel.megagroup)),
+                rank="admin" if channel.megagroup else "",
             ),
-            label="promote the operator",
+            label="promote your account",
         )
-        return True
-    except Exception as exc:  # noqa: BLE001  A member-only operator still works.
-        warning(f"The operator could not be promoted: {exc}")
-        return False
+    except WorkerUnusable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise OperatorBlocked(f"your account could not be made admin ({exc})") from exc
 
 
-async def staff_link(
-    operator: TelegramClient,
-    worker: TelegramClient,
-    channel: types.Channel,
-    promoted: bool,
-    fallback: str,
-) -> str:
-    """Export the link the staff are given.
-
-    Preferably the operator's own link: an invite link dies with the account
-    that made it, and the operator is the account meant to outlive the workers.
-    """
-    if promoted:
-        try:
-            exported = await bounded(
-                operator,
-                functions.messages.ExportChatInviteRequest(peer=channel, title="staff"),
-                label="export the staff link",
-            )
-            link = getattr(exported, "link", None)
-            if link:
-                return link
-        except Exception as exc:  # noqa: BLE001
-            warning(f"The operator could not export a link ({exc}); using the worker's.")
-    return fallback
+JOIN_ACTIONS = (
+    types.MessageActionChatJoinedByLink,
+    types.MessageActionChatJoinedByRequest,
+    types.MessageActionChatAddUser,
+)
 
 
-async def make_one_chat(
+async def drop_join_notice(operator: TelegramClient, channel: types.Channel) -> None:
+    """Delete the "joined via invite link" line a group shows for the operator."""
+    if not channel.megagroup:
+        return  # Broadcast channels announce no joins.
+    found: list[int] = []
+    with contextlib.suppress(Exception):
+        async for message in operator.iter_messages(channel, limit=10):
+            if isinstance(message.action, JOIN_ACTIONS):
+                found.append(message.id)
+    if found:
+        with contextlib.suppress(Exception):
+            await operator.delete_messages(channel, found)
+
+
+async def operator_link(operator: TelegramClient, channel: types.Channel) -> str:
+    """Export the invite link that is handed over, made by the operator."""
+    exported = await bounded(
+        operator,
+        functions.messages.ExportChatInviteRequest(peer=channel, title="copy"),
+        label="export the invite link",
+    )
+    link = getattr(exported, "link", None)
+    if not link:
+        raise RuntimeError("Telegram returned no invite link")
+    return link
+
+
+async def make_one_copy(
     operator: TelegramClient,
     operator_id: int,
     worker: Worker,
     api_id: int,
     api_hash: str,
-    title: str,
-    kind: str,
+    source: types.Channel,
+    plan: ClonePlan,
+    status: Callable[[str], Awaitable[None]],
 ) -> MadeChat:
-    """Run one worker through the whole job, start to finish.
+    """Have one worker create the channel, then copy the demo channel into it.
 
     Raises WorkerUnusable when the account itself is the problem, which is the
-    signal for .gen to set it aside and pick another one.
+    signal for .gen to set it aside and pick another one, and OperatorBlocked
+    when it is not. Either way, a channel that was created but never got its
+    copy is deleted again.
     """
+    title = utils.get_display_name(source) or "Copy"
     client = await worker_client(worker, api_id, api_hash)
+    channel: types.Channel | None = None
     try:
-        channel = await create_chat(client, title, kind)
+        await status(f"{worker.name} is creating {title!r}...")
+        channel = await create_chat(client, title, megagroup=bool(source.megagroup))
         info(f"{worker.name} created {title!r} (id {channel.id}).")
-        join_link = await operator_joins(client, operator, channel)
-        promoted = await promote_operator(client, channel, operator_id)
-        link = await staff_link(operator, client, channel, promoted, join_link)
+        await status("Joining it and becoming admin...")
+        target = await operator_joins(client, operator, channel)
+        await promote_operator(client, channel, operator_id)
+    except BaseException:
+        if channel is not None:
+            await delete_chat(client, channel)
+        raise
     finally:
         await client.disconnect()
+    await drop_join_notice(operator, target)
 
+    # From here on the operator does every write, and the worker is done. The
+    # channel exists and the worker's quota is spent, so whatever happens next
+    # is reported with the link rather than thrown away.
+    try:
+        outcome = await clone_into(operator, source, target, plan, status)
+        copied, total, report = outcome.copied, outcome.total, outcome.lines()
+    except Exception as exc:  # noqa: BLE001
+        failure(f"The copy into {title!r} stopped early: {exc}")
+        copied, total = 0, len(plan.posts)
+        report = [f"Copy stopped early: {exc}", "The channel is kept; check it by hand."]
+    try:
+        link = await operator_link(operator, target)
+    except Exception as exc:  # noqa: BLE001
+        failure(f"Could not export an invite link for {title!r}: {exc}")
+        link = f"(no invite link: {exc}; export one in the channel's settings)"
     return MadeChat(
-        chat_id=channel.id,
+        chat_id=target.id,
         title=title,
         link=link,
         worker=worker.name,
-        kind=kind,
-        promoted=promoted,
+        copied=copied,
+        total=total,
+        report=report,
     )
 
 
-async def deliver(
-    client: TelegramClient, state: AutoState, made: MadeChat
-) -> str:
-    """Post the link where the staff will see it, falling back to Saved Messages."""
-    label = "group" if made.kind == "group" else "channel"
-    text = (
-        f"New {label}: {made.title}\n"
-        f"{made.link}\n"
-        f"Made by {made.worker}"
-        + ("" if made.promoted else " (operator is a member, not an admin)")
-    )
-    target = state.delivery_id if state.delivery_id is not None else "me"
-    where = state.delivery_title or "Saved Messages"
+async def resolve_source(client: TelegramClient, state: AutoState) -> types.Channel:
+    """Return the demo channel set with .set, or explain why there is none."""
+    if state.source_id is None:
+        raise RuntimeError("no demo channel yet: send .set in it, or .set <link>")
     try:
-        await client.send_message(target, text, link_preview=False)
-        return where
-    except Exception as exc:  # noqa: BLE001  The link must not be lost.
-        failure(f"Could not post the link in {where}: {exc}")
-        if target != "me":
-            with contextlib.suppress(Exception):
-                await client.send_message("me", text, link_preview=False)
-                return "Saved Messages (the set chat refused it)"
-        return "nowhere; the link is in the terminal only"
+        source = await client.get_entity(state.source_id)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"cannot open {state.source_title or 'the demo channel'} any more ({exc}); "
+            "send .set again"
+        ) from exc
+    if not isinstance(source, types.Channel) or not is_supported_chat(source):
+        raise RuntimeError("the demo channel is not a channel or group that can be copied")
+    return source
 
 
 # ---------------------------------------------------------------------------
@@ -658,22 +721,43 @@ async def deliver(
 async def command_set(
     client: TelegramClient, state: AutoState, event: Any, args: list[str]
 ) -> None:
-    """Choose the chat that receives every invite link."""
+    """Choose the demo channel that every .gen copies.
+
+    Sent inside the demo channel it picks that channel; with a link, invite or
+    @handle it picks that one, which is how an admin sets it from a DM.
+    """
     if args and looks_like_chat_reference(args[0]):
         try:
             chat = await resolve_clone_source(client, args[0])
         except Exception as exc:  # noqa: BLE001
             await set_status(event, f"Cannot use {args[0]}: {exc}")
             return
-        state.delivery_id = utils.get_peer_id(chat)
-        state.delivery_title = utils.get_display_name(chat) or args[0]
+    elif args:
+        await set_status(event, f"{args[0]} is not a channel link, invite or @handle.")
+        return
     else:
         chat = await event.get_chat()
-        state.delivery_id = event.chat_id
-        state.delivery_title = utils.get_display_name(chat) or str(event.chat_id)
+
+    if not isinstance(chat, types.Channel) or not is_supported_chat(chat):
+        await set_status(
+            event,
+            "Send .set inside the demo channel, or .set <link to it>. "
+            "This chat is not a channel or group that can be copied.",
+        )
+        return
+
+    state.source_id = utils.get_peer_id(chat)
+    state.source_title = utils.get_display_name(chat) or str(chat.id)
     state.save()
-    success(f"Links will be posted in {state.delivery_title}.")
-    await set_status(event, f"Links will be posted here: {state.delivery_title}.")
+    plan = await collect_clone_posts(client, chat)
+    free, _used, _aside = state.counts
+    success(f"Demo channel set: {state.source_title} ({len(plan.posts)} posts).")
+    await set_status(
+        event,
+        f"Demo channel set: {state.source_title}\n"
+        f"{len(plan.posts)} post(s) will be copied by each .gen.\n"
+        f"Workers ready: {free}",
+    )
 
 
 async def command_login(
@@ -832,41 +916,8 @@ async def command_accounts(
         else:
             mark = "ready"
         lines.append(f"{worker.name}  {worker.label}  {mask_phone(worker.phone)}  {mark}")
-    lines.append(f"Creates: {state.kind}   Titles: {state.title_template}")
-    lines.append(f"Links go to: {state.delivery_title or 'Saved Messages (no .set yet)'}")
+    lines.append(f"Demo channel: {state.source_title or 'none yet, send .set in it'}")
     await set_status(event, "\n".join(lines))
-
-
-async def command_kind(
-    _client: TelegramClient, state: AutoState, event: Any, args: list[str]
-) -> None:
-    """Choose whether .gen makes a group or a broadcast channel."""
-    wanted = (args[0].lower() if args else "")
-    if wanted in {"group", "gc", "supergroup"}:
-        state.kind = "group"
-    elif wanted in {"channel", "broadcast"}:
-        state.kind = "channel"
-    else:
-        await set_status(event, "Usage: .kind group   or   .kind channel")
-        return
-    state.save()
-    await set_status(event, f".gen will create a {state.kind} from now on.")
-
-
-async def command_title(
-    _client: TelegramClient, state: AutoState, event: Any, args: list[str]
-) -> None:
-    """Set the title template new chats are named with."""
-    if not args:
-        await set_status(
-            event,
-            f"Titles: {state.title_template} (next number {state.counter + 1})\n"
-            "Usage: .title Demo {n}",
-        )
-        return
-    state.title_template = " ".join(args).strip()
-    state.save()
-    await set_status(event, f"New chats will be titled: {state.title_template}")
 
 
 async def command_reset(
@@ -920,13 +971,19 @@ async def command_gen(
     api_id: int,
     api_hash: str,
 ) -> None:
-    """Make chats with unused workers and hand over the links."""
+    """Make copies of the demo channel, one unused worker per copy."""
     count = 1
-    words = list(args)
-    if words and words[0].isdigit():
-        count = max(1, min(int(words[0]), 50))
-        words = words[1:]
-    override = " ".join(words).strip()
+    if args:
+        if not args[0].isdigit() or int(args[0]) < 1:
+            await set_status(event, "Usage: .gen   or   .gen <how many copies>")
+            return
+        count = min(int(args[0]), GEN_LIMIT)
+
+    try:
+        source = await resolve_source(client, state)
+    except RuntimeError as exc:
+        await set_status(event, f"Cannot .gen: {exc}")
+        return
 
     free, _used, _aside = state.counts
     if not free:
@@ -937,33 +994,60 @@ async def command_gen(
         )
         return
     if count > free:
-        warning(f"{count} asked for, but only {free} worker(s) are ready.")
+        warning(f"{count} copies asked for, but only {free} worker(s) are ready.")
         count = free
+
+    name = utils.get_display_name(source)
+    await set_status(event, f"Reading {name}...")
+    # Read once for the whole run: every copy gets the same posts in the same
+    # order, and an expired file reference is re-uploaded post by post.
+    plan = await collect_clone_posts(client, source, command_id=event.id)
+    if not plan.posts:
+        await set_status(event, f"{name} has no posts to copy.")
+        return
+    info(f"{name}: {len(plan.posts)} post(s) per copy, {count} copy(ies) to make.")
 
     me = await client.get_me()
     made: list[MadeChat] = []
+    stopped = ""
     for number in range(1, count + 1):
-        await set_status(event, f"Making chat {number}/{count}...")
-        result = await _gen_once(client, me.id, state, api_id, api_hash, override)
+        prefix = f"Copy {number}/{count} of {name}: "
+
+        async def status(text: str, prefix: str = prefix) -> None:
+            await set_status(event, prefix + text)
+
+        try:
+            result = await _gen_once(
+                client, me.id, state, api_id, api_hash, source, plan, status
+            )
+        except OperatorBlocked as exc:
+            stopped = str(exc)
+            failure(f".gen stopped: {exc}")
+            break
         if result is None:
+            stopped = "no worker could create a channel"
             break
         made.append(result)
-        where = await deliver(client, state, result)
-        success(f"{result.title}: {result.link} (posted in {where})")
+        report = "\n".join([f"{result.title}", result.link, *result.report])
+        success(f"{result.title}: {result.link}")
+        with contextlib.suppress(Exception):
+            await client.send_message("me", report, link_preview=False)
         if number < count:
             await asyncio.sleep(GEN_DELAY)
 
     free, used, aside = state.counts
-    if not made:
-        await set_status(event, "No chat was made; every worker was refused.")
-        return
-    lines = [f"Made {len(made)} {'chat' if len(made) == 1 else 'chats'}:"]
-    lines += [f"{item.title}\n{item.link}" for item in made]
-    lines.append(f"Workers: {free} ready, {used} spent, {aside} aside")
-    if state.delivery_title:
-        lines.append(f"Links posted in {state.delivery_title}")
+    lines: list[str] = []
+    if made:
+        lines.append(f"Made {len(made)} cop{'y' if len(made) == 1 else 'ies'} of {name}:")
+        for item in made:
+            lines += ["", item.title, item.link, *item.report[:2]]
     else:
-        lines.append("Links went to Saved Messages; use .set to choose a chat")
+        lines.append(f"No copy of {name} was made.")
+    if stopped:
+        lines += ["", f"Stopped: {stopped}"]
+    lines += ["", f"Workers: {free} ready, {used} spent, {aside} aside"]
+    if made:
+        lines.append("Full reports are in Saved Messages.")
     await set_status(event, "\n".join(lines))
 
 
@@ -973,31 +1057,35 @@ async def _gen_once(
     state: AutoState,
     api_id: int,
     api_hash: str,
-    override: str,
+    source: types.Channel,
+    plan: ClonePlan,
+    status: Callable[[str], Awaitable[None]],
 ) -> MadeChat | None:
-    """Make one chat, moving on to another worker while any are left.
+    """Make one copy, moving on to another worker while any are left.
 
-    The title is settled before the first attempt, so a worker that has to be
-    set aside does not burn a number and leave a gap in the titles.
+    A worker that cannot create the channel is set aside and the next one is
+    tried. OperatorBlocked is passed up, because it would stop every worker the
+    same way. A worker is marked used as soon as its channel exists, since the
+    channel quota is spent whether or not every post copies.
     """
-    title = override or state.next_title()
     while True:
         worker = state.pick()
         if worker is None:
             return None
         try:
-            made = await make_one_chat(
-                client, operator_id, worker, api_id, api_hash, title, state.kind
+            made = await make_one_copy(
+                client, operator_id, worker, api_id, api_hash, source, plan, status
             )
         except WorkerUnusable as exc:
             worker.disabled = str(exc)
             state.save()
             warning(f"{worker.name} set aside: {exc}. Trying another worker.")
             continue
+        except OperatorBlocked:
+            raise
         except Exception as exc:  # noqa: BLE001  Keep the worker, report the failure.
-            failure(f"{worker.name} could not make {title!r}: {exc}")
-            state.save()  # The title counter moved; keep it.
-            return None
+            failure(f"{worker.name} could not make the copy: {exc}")
+            raise OperatorBlocked(f"the copy failed ({exc})") from exc
 
         worker.used = True
         worker.made.append(made.to_json())
@@ -1005,14 +1093,53 @@ async def _gen_once(
         return made
 
 
+class StatusElsewhere:
+    """A command event whose progress is shown in another message.
+
+    A command typed inside the demo channel must not stay there: the channel
+    is what every copy is made from. The command message is deleted and the
+    progress goes to a fresh message elsewhere, while everything else, such as
+    which chat the command came from, still reads from the real event.
+    """
+
+    out = True  # set_status edits this rather than replying to it.
+
+    def __init__(self, event: Any, status_message: Any) -> None:
+        self._event = event
+        self._status = status_message
+
+    async def edit(self, text: str, **kwargs: Any) -> Any:
+        """Edit the stand-in status message."""
+        return await self._status.edit(text, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._event, name)
+
+
+async def keep_out_of_source(client: TelegramClient, state: AutoState, event: Any, name: str, args: list[str]) -> Any:
+    """Move a command out of the demo channel, returning the event to use.
+
+    Applies to anything sent in the demo channel, and to a bare .set sent in
+    any channel or group, since that one is about to become the demo channel.
+    """
+    in_source = state.source_id is not None and event.chat_id == state.source_id
+    setting_here = name == "set" and not args and not getattr(event, "is_private", False)
+    if not (in_source or setting_here):
+        return event
+    with contextlib.suppress(Exception):
+        await event.delete()
+    # The account itself reads its Saved Messages; an admin gets a DM.
+    where = "me" if getattr(event, "out", False) else event.sender_id
+    status_message = await client.send_message(where, f".{name}: working...")
+    return StatusElsewhere(event, status_message)
+
+
 COMMAND_HELP = (
     "Auto maker\n"
-    ".set [link]            post the invite links in this chat\n"
+    ".set [link]            choose the demo channel (send it in the channel)\n"
+    ".gen [count]           make copies of the demo channel\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
-    ".gen [count] [title]   make chats with unused workers\n"
-    ".accounts              list the workers and the settings\n"
-    ".kind group|channel    what .gen creates\n"
-    ".title Demo {n}        title template for new chats\n"
+    ".accounts              list the workers and the demo channel\n"
     ".reset [name|all]      mark workers unused again\n"
     ".remove <name>         forget a worker and its session\n"
     ".cancel                stop a login that is waiting\n"
@@ -1027,8 +1154,6 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "login": command_login,
     "gen": command_gen,
     "accounts": command_accounts,
-    "kind": command_kind,
-    "title": command_title,
     "reset": command_reset,
     "remove": command_remove,
 }
@@ -1076,6 +1201,8 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
             if name == "login":
                 awaiting.add(event.chat_id)
             try:
+                if name in {"set", "gen"}:
+                    event = await keep_out_of_source(client, state, event, name, args)
                 if name in WITH_CREDENTIALS:
                     await handler(client, state, event, args, api_id, api_hash)
                 else:
@@ -1091,7 +1218,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
     print(Fore.WHITE + COMMAND_HELP)
     info(f"State file: {state.path} (holds the worker sessions; keep it private)")
     info(f"Workers: {free} ready, {used} spent, {aside} set aside")
-    info(f"Creates: {state.kind}. Links go to: {state.delivery_title or 'Saved Messages'}")
+    info(f"Demo channel: {state.source_title or 'none yet, send .set in it'}")
     if not state.workers:
         warning("No workers yet. Send .login to add one.")
     report_gate(gate)

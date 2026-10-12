@@ -19,7 +19,7 @@ import sys
 import tempfile
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar, Union
 
@@ -1790,7 +1790,10 @@ COMMAND_TRACE_RE = re.compile(
 # A dot command on its own, as an admin from another account types it. Status
 # lines are only matched on this account's own messages, but a command an
 # admin sent is theirs, so it is matched whoever sent it.
-DOT_COMMAND_RE = re.compile(r"^\.(?:clone|change|help|allow|deny|admins)\b[^\n]*$")
+DOT_COMMAND_RE = re.compile(
+    r"^\.(?:clone|change|help|allow|deny|admins"
+    r"|set|gen|login|accounts|reset|remove|cancel)\b[^\n]*$"
+)
 
 
 def is_command_trace(message: Message) -> bool:
@@ -2337,17 +2340,206 @@ async def verify_clone_order(
     return mismatches
 
 
+PIN_ACTIONS = (types.MessageActionPinMessage,)
+
+
+async def delete_recent_service(
+    client: TelegramClient, target: types.Channel, actions: tuple[type, ...]
+) -> None:
+    """Delete the newest service messages of the given kinds, quietly."""
+    found: list[int] = []
+    with contextlib.suppress(Exception):
+        async for message in client.iter_messages(target, limit=10):
+            if isinstance(message.action, actions):
+                found.append(message.id)
+    if found:
+        with contextlib.suppress(Exception):
+            await retry_on_wait(client.delete_messages, target, found)
+
+
+async def source_extras(client: TelegramClient, source: ChatEntity) -> tuple[bool, int | None]:
+    """Return whether the source restricts saving content, and its pinned post."""
+    protected = bool(getattr(source, "noforwards", False))
+    pinned = None
+    with contextlib.suppress(Exception):
+        if isinstance(source, types.Channel):
+            full = await retry_on_wait(
+                client, functions.channels.GetFullChannelRequest(channel=source)
+            )
+        else:
+            full = await retry_on_wait(
+                client, functions.messages.GetFullChatRequest(chat_id=source.id)
+            )
+        pinned = getattr(full.full_chat, "pinned_msg_id", None)
+    return protected, pinned
+
+
+@dataclass
+class CloneOutcome:
+    """Everything one clone run did, for the final report."""
+
+    total: int = 0
+    copied: int = 0
+    gaps: list[int] = field(default_factory=list)
+    degraded: int = 0
+    lost_formatting: list[ClonedPost] = field(default_factory=list)
+    repointed: int = 0
+    untouched: int = 0
+    link_failures: int = 0
+    order_line: str = ""
+    details: list[str] = field(default_factory=list)
+    skipped_traces: int = 0
+
+    @property
+    def ok(self) -> bool:
+        """Return whether the clone is a complete, verified copy."""
+        return not self.gaps and self.order_line.startswith("Order check: all")
+
+    def lines(self) -> list[str]:
+        """Return the report, one fact per line."""
+        out = [f"Posts: {self.copied}/{self.total}", self.order_line]
+        if self.details:
+            out.append(f"Copied: {', '.join(self.details)}")
+        if self.skipped_traces:
+            out.append(f"Left out bot command messages: {self.skipped_traces}")
+        if self.repointed:
+            out.append(f"Links repointed at the clone: {self.repointed}")
+        if self.untouched:
+            out.append(f"Links left pointing at the source: {self.untouched}")
+        if self.link_failures:
+            out.append(f"Links that could not be edited: {self.link_failures}")
+        if self.degraded:
+            out.append(f"Sent without premium emoji: {self.degraded}")
+        if self.lost_formatting:
+            out.append(
+                "Formatting Telegram would not keep: "
+                + "; ".join(
+                    f"post {result.number} ({result.formatting_lost})"
+                    for result in self.lost_formatting[:5]
+                )
+            )
+        if self.gaps:
+            out.append(f"Could not clone post(s): {', '.join(str(n) for n in self.gaps)}")
+        return out
+
+
+async def clone_into(
+    client: TelegramClient,
+    source: ChatEntity,
+    target: types.Channel,
+    plan: ClonePlan,
+    status: Callable[[str], Awaitable[None]],
+) -> CloneOutcome:
+    """Make target an exact copy of source, posted by this account.
+
+    target may be a channel this account created, or one another account
+    created and made this account an admin of; either way this account does
+    every write. The profile photo and description go first, so the channel
+    looks right from its first post; then every post one by one in order,
+    then links between posts are pointed at the clone, the source's pinned
+    post is pinned, content protection is switched on when the source has it,
+    and finally the clone is read back to prove post N is source post N.
+    """
+    outcome = CloneOutcome(total=len(plan.posts), skipped_traces=plan.skipped_traces)
+    posts = plan.posts
+
+    try:
+        if await copy_chat_photo(client, source, target):
+            outcome.details.append("profile photo")
+    except Exception as exc:  # noqa: BLE001
+        warning(f"Could not copy the profile photo: {exc}")
+    try:
+        if await copy_chat_about(client, source, target):
+            outcome.details.append("description")
+    except Exception as exc:  # noqa: BLE001
+        warning(f"Could not copy the description: {exc}")
+
+    protected, pinned_source_id = await source_extras(client, source)
+    if protected:
+        warning("Source has content protection enabled; some media may be refused.")
+
+    id_map: dict[int, int] = {}
+    links = CloneLinks(
+        username=entity_username(source) if isinstance(source, types.Channel) else None,
+        channel_id=source.id,
+        target=target,
+        id_map=id_map,
+    )
+    pending_links: list[tuple[int, Message]] = []
+    results: list[ClonedPost] = []
+    await status(f"Copying {len(posts)} post(s)...")
+
+    for number, batch in enumerate(posts, start=1):
+        result = await clone_one_post(client, target, number, batch, id_map)
+        results.append(result)
+        for source_message, new_message in zip(batch, result.sent, strict=False):
+            if links.present_in(source_message):
+                pending_links.append((new_message.id, source_message))
+        if number % STATUS_EVERY == 0:
+            await status(f"Copying posts... {number}/{len(posts)}")
+        await asyncio.sleep(CLONE_DELAY)
+
+    outcome.gaps = [result.number for result in results if not result.sent]
+    outcome.degraded = sum(1 for result in results if result.degraded)
+    outcome.lost_formatting = [result for result in results if result.formatting_lost]
+    outcome.copied = len(posts) - len(outcome.gaps)
+    success(f"Copied {outcome.copied}/{len(posts)} post(s) in the source's order.")
+
+    if pending_links:
+        info(f"Repointing links in {len(pending_links)} cloned post(s)...")
+        await status(f"Repointing links in {len(pending_links)} post(s)...")
+        outcome.repointed, outcome.untouched, outcome.link_failures = (
+            await repoint_clone_links(client, links, pending_links)
+        )
+        success(f"Repointed links in {outcome.repointed} post(s).")
+
+    pinned = id_map.get(pinned_source_id) if pinned_source_id else None
+    if pinned is not None:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.UpdatePinnedMessageRequest(
+                    peer=target, id=pinned, silent=True
+                ),
+            )
+            await delete_recent_service(client, target, PIN_ACTIONS)
+            outcome.details.append("pinned post")
+        except Exception as exc:  # noqa: BLE001
+            warning(f"Could not pin the cloned post: {exc}")
+
+    if protected:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.ToggleNoForwardsRequest(peer=target, enabled=True),
+            )
+            outcome.details.append("content protection")
+        except Exception as exc:  # noqa: BLE001
+            warning(f"Could not switch on content protection: {exc}")
+
+    relinked = {message.id for _new_id, message in pending_links}
+    try:
+        mismatches = await verify_clone_order(client, target, posts, results, relinked)
+        outcome.order_line = (
+            f"Order check: all {outcome.copied} post(s) match the source, "
+            f"1 to {len(posts)}, formatting included"
+            if not mismatches
+            else "Order check FAILED: " + "; ".join(mismatches[:5])
+        )
+    except Exception as exc:  # noqa: BLE001
+        outcome.order_line = f"Order check could not run: {exc}"
+    (success if outcome.order_line.startswith("Order check: all") else failure)(
+        outcome.order_line
+    )
+    return outcome
+
+
 async def command_clone(client: TelegramClient, event: object, args: list[str]) -> None:
     """Clone a chat into a fresh private channel.
 
     With no link the current chat is cloned. A first argument that names a
     chat, by invite link, public link or @handle, clones that chat instead
     and any remaining words become the new title.
-
-    The clone is an exact copy: the source's profile photo and description,
-    then every post one by one in the source's order, nothing added, skipped
-    or moved. Once every post exists, links between posts are pointed at the
-    clone, and the clone is read back to prove post N matches source post N.
     """
     title_words = list(args)
     if args and looks_like_chat_reference(args[0]):
@@ -2373,13 +2565,10 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     info(f"Reading {source_name}...")
     await set_status(event, f"Reading {source_name}...")
     plan = await collect_clone_posts(client, source, command_id=event.id)
-    posts = plan.posts
-    if not posts:
+    if not plan.posts:
         await set_status(event, f"{source_name} has no posts to clone.")
         return
-    info(f"{len(posts)} post(s) to clone, one by one in the source's order.")
-    if plan.skipped_traces:
-        info(f"Left out {plan.skipped_traces} bot command/status message(s).")
+    info(f"{len(plan.posts)} post(s) to clone, one by one in the source's order.")
 
     await set_status(event, f"Creating private channel {title!r}...")
     created = await retry_on_wait(
@@ -2389,99 +2578,17 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
     target = channel_from_updates(created)
     success(f"Created private channel {title!r} (id {target.id}).")
 
-    copied_details: list[str] = []
-    try:
-        if await copy_chat_photo(client, source, target):
-            copied_details.append("profile photo")
-    except Exception as exc:  # noqa: BLE001
-        warning(f"Could not copy the profile photo: {exc}")
-    try:
-        if await copy_chat_about(client, source, target):
-            copied_details.append("description")
-    except Exception as exc:  # noqa: BLE001
-        warning(f"Could not copy the description: {exc}")
+    async def status(text: str) -> None:
+        await set_status(event, f"{title}: {text}")
 
-    if getattr(source, "noforwards", False):
-        warning("Source has content protection enabled; some media may be refused.")
-
-    id_map: dict[int, int] = {}
-    links = CloneLinks(
-        username=entity_username(source) if isinstance(source, types.Channel) else None,
-        channel_id=source.id,
-        target=target,
-        id_map=id_map,
-    )
-    pending_links: list[tuple[int, Message]] = []
-    results: list[ClonedPost] = []
-    await set_status(event, f"Cloning {len(posts)} post(s) into {title!r}...")
-
-    for number, batch in enumerate(posts, start=1):
-        result = await clone_one_post(client, target, number, batch, id_map)
-        results.append(result)
-        for source_message, new_message in zip(batch, result.sent, strict=False):
-            if links.present_in(source_message):
-                pending_links.append((new_message.id, source_message))
-        if number % STATUS_EVERY == 0:
-            await set_status(event, f"Cloning into {title!r}... {number}/{len(posts)}")
-        await asyncio.sleep(CLONE_DELAY)
-
-    gaps = [result.number for result in results if not result.sent]
-    degraded = sum(1 for result in results if result.degraded)
-    copied = len(posts) - len(gaps)
-    success(f"Copied {copied}/{len(posts)} post(s) in the source's order.")
-
-    repointed = untouched = link_failures = 0
-    if pending_links:
-        info(f"Repointing links in {len(pending_links)} cloned post(s)...")
-        await set_status(event, f"Repointing links in {len(pending_links)} post(s)...")
-        repointed, untouched, link_failures = await repoint_clone_links(
-            client, links, pending_links
-        )
-        success(f"Repointed links in {repointed} post(s).")
-    else:
-        info("No post carried a link to the source, so none needed repointing.")
-
-    # Read the finished clone back and compare it with the source, post by post.
-    relinked = {message.id for _new_id, message in pending_links}
-    try:
-        mismatches = await verify_clone_order(client, target, posts, results, relinked)
-        order_line = (
-            f"Order check: all {copied} post(s) match the source, 1 to {len(posts)}, "
-            "formatting included"
-            if not mismatches
-            else "Order check FAILED: " + "; ".join(mismatches[:5])
-        )
-    except Exception as exc:  # noqa: BLE001
-        order_line = f"Order check could not run: {exc}"
-    (success if order_line.startswith("Order check: all") else failure)(order_line)
+    outcome = await clone_into(client, source, target, plan, status)
 
     exported = await retry_on_wait(
         client,
         functions.messages.ExportChatInviteRequest(peer=target, title="clone"),
     )
     link = getattr(exported, "link", None) or "no link returned"
-
-    report = f"Cloned {copied}/{len(posts)} post(s) into {title!r}\n{link}\n{order_line}"
-    if copied_details:
-        report += f"\nCopied: {', '.join(copied_details)}"
-    if plan.skipped_traces:
-        report += f"\nLeft out bot command messages: {plan.skipped_traces}"
-    if repointed:
-        report += f"\nLinks repointed at the clone: {repointed}"
-    if untouched:
-        report += f"\nLinks left pointing at the source: {untouched}"
-    if link_failures:
-        report += f"\nLinks that could not be edited: {link_failures}"
-    if degraded:
-        report += f"\nSent without premium emoji: {degraded}"
-    lost_formatting = [result for result in results if result.formatting_lost]
-    if lost_formatting:
-        report += "\nFormatting Telegram would not keep: " + "; ".join(
-            f"post {result.number} ({result.formatting_lost})"
-            for result in lost_formatting[:5]
-        )
-    if gaps:
-        report += f"\nCould not clone post(s): {', '.join(str(number) for number in gaps)}"
+    report = "\n".join([f"Cloned {source_name} into {title!r}", link, *outcome.lines()])
 
     saved = True
     try:
@@ -2490,7 +2597,7 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
         saved = False
         failure(f"Could not save the invite link to Saved Messages: {exc}")
 
-    success(f"Clone finished: {copied}/{len(posts)} copied, {len(gaps)} gap(s).")
+    success(f"Clone finished: {outcome.copied}/{outcome.total} copied, {len(outcome.gaps)} gap(s).")
     success(f"Invite link: {link}")
     await set_status(
         event,

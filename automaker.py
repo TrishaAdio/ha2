@@ -51,6 +51,7 @@ from telethon.sessions import StringSession
 from main import (
     COMMAND_PATTERN,
     GATE_HELP,
+    PLAIN,
     ClonePlan,
     CommandGate,
     channel_from_updates,
@@ -109,6 +110,36 @@ class OperatorBlocked(Exception):
     Not the worker's fault, and trying the next worker would fail the same way
     while burning its channel quota too, so .gen stops instead.
     """
+
+
+def short_error(exc: BaseException) -> str:
+    """Return an error as one short line fit for a chat message.
+
+    Telethon's messages run to several sentences and end with "(caused by
+    NoneType)", which is noise in a report listing six accounts.
+    """
+    text = str(exc).split("(caused by")[0].strip()
+    text = " ".join(text.split())
+    if len(text) > 70:
+        text = text[:69].rstrip(" ,.;") + "…"
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def why_unusable(exc: BaseException) -> str:
+    """Say, in plain words, why an account Telegram refused cannot be used."""
+    if isinstance(exc, WorkerUnusable):
+        return str(exc)
+    if isinstance(exc, errors.FrozenMethodInvalidError):
+        return "the account is frozen by Telegram"
+    if isinstance(exc, errors.UserRestrictedError):
+        return "Telegram restricts this account (spam limit)"
+    if isinstance(exc, errors.ChannelsTooMuchError):
+        return "it has created as many channels as Telegram allows"
+    if isinstance(exc, errors.ChatAdminRequiredError):
+        return "it could not hand over admin rights in its own channel"
+    if isinstance(exc, DEAD_SESSION_ERRORS):
+        return f"its session is dead ({type(exc).__name__})"
+    return short_error(exc)
 
 
 def now_stamp() -> str:
@@ -315,12 +346,23 @@ class AutoState:
             raise
 
     def find(self, name: str) -> Worker | None:
-        """Return a worker by name, case-insensitively."""
-        wanted = name.strip().lower()
+        """Return a worker by its short name, or by the account's own name.
+
+        .accounts lists both, so either is a reasonable thing to type; only the
+        short name used to work, which made ".remove Rizwan Raza" answer "no
+        worker called Rizwan".
+        """
+        wanted = name.strip().lower().lstrip("@")
+        if not wanted:
+            return None
         for worker in self.workers:
             if worker.name.lower() == wanted:
                 return worker
-        return None
+        for worker in self.workers:
+            if worker.label.lower() == wanted or worker.phone == wanted:
+                return worker
+        matches = [worker for worker in self.workers if wanted in worker.label.lower()]
+        return matches[0] if len(matches) == 1 else None
 
     def next_name(self) -> str:
         """Return the next free worker name: w1, w2, and so on."""
@@ -489,12 +531,14 @@ async def create_chat(
     )
     try:
         created = await bounded(client, request, label="create a channel")
-    except errors.ChannelsTooMuchError as exc:
-        raise WorkerUnusable("it has created as many channels as Telegram allows") from exc
-    except DEAD_SESSION_ERRORS as exc:
-        raise WorkerUnusable(f"its session died ({type(exc).__name__})") from exc
-    except errors.UserRestrictedError as exc:
-        raise WorkerUnusable("Telegram restricts this account (spam limit)") from exc
+    except WorkerUnusable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Whatever Telegram says here, this account cannot make the channel, so
+        # it is set aside and the next worker is tried. Letting the error
+        # through instead was what stopped a whole .gen on the first frozen
+        # account while six usable workers were never asked.
+        raise WorkerUnusable(why_unusable(exc)) from exc
     return channel_from_updates(created)
 
 
@@ -520,14 +564,19 @@ async def operator_joins(
     operator makes with the worker's copy is refused; the operator's own copy
     comes back from the join itself.
     """
-    exported = await bounded(
-        worker,
-        functions.messages.ExportChatInviteRequest(peer=channel, title="operator"),
-        label="export an invite link",
-    )
-    link = getattr(exported, "link", None)
-    if not link:
-        raise RuntimeError("Telegram returned no invite link for the new channel")
+    try:
+        exported = await bounded(
+            worker,
+            functions.messages.ExportChatInviteRequest(peer=channel, title="operator"),
+            label="export an invite link",
+        )
+        link = getattr(exported, "link", None)
+        if not link:
+            raise RuntimeError("Telegram returned no invite link")
+    except WorkerUnusable:
+        raise
+    except Exception as exc:  # noqa: BLE001  Still the worker's own channel.
+        raise WorkerUnusable(f"it cannot invite anyone in ({why_unusable(exc)})") from exc
     invite = invite_hash_of(link)
 
     try:
@@ -547,10 +596,16 @@ async def operator_joins(
         raise OperatorBlocked(
             "your account is in as many channels as Telegram allows; leave some"
         ) from exc
+    except errors.FrozenMethodInvalidError as exc:
+        raise OperatorBlocked(
+            "your own account is frozen by Telegram, so it cannot join or post"
+        ) from exc
     except WorkerUnusable as exc:
         # A long flood wait on the operator is the operator's problem, not
         # the worker's, and every other worker would hit it too.
         raise OperatorBlocked(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001  The operator could not get in.
+        raise OperatorBlocked(f"your account could not join ({why_unusable(exc)})") from exc
 
 
 async def promote_operator(
@@ -561,7 +616,7 @@ async def promote_operator(
     The worker has to learn the operator's access hash before it can name it in
     a request, and reading the member list is what teaches it: the operator has
     just joined, so it is in there. Without admin rights the operator could not
-    post a single message, so a failure here stops the copy.
+    post a single message, so a failure here sets the worker aside.
     """
     participants = await bounded(
         worker,
@@ -583,7 +638,7 @@ async def promote_operator(
         None,
     )
     if found is None:
-        raise OperatorBlocked("the worker cannot see your account among the members")
+        raise WorkerUnusable("it cannot see your account among the new members")
 
     try:
         await bounded(
@@ -601,7 +656,13 @@ async def promote_operator(
     except WorkerUnusable:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise OperatorBlocked(f"your account could not be made admin ({exc})") from exc
+        # The worker owns this channel, so if it cannot hand over admin rights
+        # the worker is the problem and another one is worth trying.
+        raise WorkerUnusable(
+            "it could not make your account admin"
+            if isinstance(exc, errors.ChatAdminRequiredError)
+            else f"it could not make your account admin ({why_unusable(exc)})"
+        ) from exc
 
 
 JOIN_ACTIONS = (
@@ -910,12 +971,16 @@ async def command_accounts(
     lines = [f"Workers: {len(state.workers)} ({free} ready, {used} spent, {aside} aside)"]
     for worker in state.workers:
         if worker.disabled:
-            mark = f"aside: {worker.disabled}"
+            mark = f"ASIDE - {worker.disabled}"
         elif worker.used:
             mark = f"spent, made {len(worker.made)}"
         else:
             mark = "ready"
         lines.append(f"{worker.name}  {worker.label}  {mask_phone(worker.phone)}  {mark}")
+    if aside:
+        lines.append(
+            f"{aside} set aside. .reset all retries them; .remove aside forgets them."
+        )
     lines.append(f"Demo channel: {state.source_title or 'none yet, send .set in it'}")
     await set_status(event, "\n".join(lines))
 
@@ -923,44 +988,114 @@ async def command_accounts(
 async def command_reset(
     _client: TelegramClient, state: AutoState, event: Any, args: list[str]
 ) -> None:
-    """Put spent workers back in the pool."""
-    target = args[0] if args else "all"
-    if target.lower() == "all":
+    """Put spent and set-aside workers back in the pool.
+
+    "all" clears the set-aside reason as well as the spent mark. Clearing only
+    the spent mark meant .reset all could answer "0 ready" while every worker
+    sat aside, and the next .gen then said there was no worker left.
+    """
+    target = " ".join(args).strip() or "all"
+    if target.lower() in {"all", "aside", "disabled"}:
+        freed = 0
         for worker in state.workers:
+            if worker.used or worker.disabled:
+                freed += 1
             worker.used = False
+            worker.disabled = ""
         state.save()
         free, _used, _aside = state.counts
-        await set_status(event, f"Every worker is unused again: {free} ready.")
+        if not state.workers:
+            await set_status(event, "There are no workers yet. Add one with .login.")
+            return
+        await set_status(
+            event,
+            f"Freed {freed} worker(s); {free} ready for .gen.\n"
+            "A worker Telegram still refuses is set aside again on the next .gen.",
+        )
         return
     worker = state.find(target)
     if worker is None:
-        await set_status(event, f"No worker called {target}.")
+        await set_status(event, f"No worker matches {target!r}. Check .accounts.")
         return
     worker.used = False
     worker.disabled = ""
     state.save()
-    await set_status(event, f"{worker.name} is ready again.")
+    await set_status(event, f"{worker.name} ({worker.label}) is ready again.")
 
 
 async def command_remove(
     _client: TelegramClient, state: AutoState, event: Any, args: list[str]
 ) -> None:
-    """Forget a worker, dropping its stored session."""
-    if not args:
-        await set_status(event, "Usage: .remove <name>")
+    """Forget workers, dropping their stored sessions.
+
+    Takes a short name, an account name, or several of either: one per line, or
+    separated by commas. "aside" removes every set-aside worker and "all"
+    removes the lot, which beats typing .remove thirteen times.
+    """
+    raw = " ".join(args).strip()
+    if not raw:
+        await set_status(
+            event,
+            "Usage: .remove <name>     (w3, or the account's name)\n"
+            "       .remove aside      every worker Telegram refused\n"
+            "       .remove all        every worker",
+        )
         return
-    worker = state.find(args[0])
-    if worker is None:
-        await set_status(event, f"No worker called {args[0]}.")
+
+    if raw.lower() in {"all", "aside", "disabled"}:
+        doomed = (
+            list(state.workers)
+            if raw.lower() == "all"
+            else [worker for worker in state.workers if worker.disabled]
+        )
+        if not doomed:
+            await set_status(event, "Nothing to remove.")
+            return
+        for worker in doomed:
+            state.workers.remove(worker)
+        state.save()
+        success(f"Removed {len(doomed)} worker(s).")
+        await set_status(
+            event,
+            f"Removed {len(doomed)} worker(s): "
+            + ", ".join(f"{worker.name} ({worker.label})" for worker in doomed[:12])
+            + ".\nTheir sessions are gone from the state file; log them out of "
+            "Telegram itself to be sure.",
+        )
         return
-    state.workers.remove(worker)
-    state.save()
-    success(f"Removed worker {worker.name}.")
-    await set_status(
-        event,
-        f"Removed {worker.name} ({worker.label}). Its session is gone from the "
-        "state file; log it out of Telegram itself to be sure.",
-    )
+
+    # One target per line, or comma separated. A line may repeat the command,
+    # which is what a pasted list of ".remove w1" lines looks like.
+    targets: list[str] = []
+    for piece in re.split(r"[\n,]+", raw):
+        piece = re.sub(r"^\s*\.remove\b", "", piece, flags=re.IGNORECASE).strip()
+        if piece:
+            targets.append(piece)
+
+    removed: list[str] = []
+    unknown: list[str] = []
+    for target in targets:
+        worker = state.find(target)
+        if worker is None:
+            unknown.append(target)
+            continue
+        state.workers.remove(worker)
+        removed.append(f"{worker.name} ({worker.label})")
+    if removed:
+        state.save()
+        success(f"Removed {len(removed)} worker(s).")
+
+    lines: list[str] = []
+    if removed:
+        lines.append(f"Removed {len(removed)}: " + ", ".join(removed))
+        lines.append(
+            "Their sessions are gone from the state file; log them out of "
+            "Telegram itself to be sure."
+        )
+    if unknown:
+        lines.append("No worker matches: " + ", ".join(unknown[:12]))
+        lines.append("Check .accounts for the names.")
+    await set_status(event, "\n".join(lines))
 
 
 async def command_gen(
@@ -1009,6 +1144,7 @@ async def command_gen(
 
     me = await client.get_me()
     made: list[MadeChat] = []
+    refused: list[tuple[str, str]] = []  # Workers set aside during this run.
     stopped = ""
     for number in range(1, count + 1):
         prefix = f"Copy {number}/{count} of {name}: "
@@ -1018,20 +1154,20 @@ async def command_gen(
 
         try:
             result = await _gen_once(
-                client, me.id, state, api_id, api_hash, source, plan, status
+                client, me.id, state, api_id, api_hash, source, plan, status, refused
             )
         except OperatorBlocked as exc:
-            stopped = str(exc)
+            stopped = f"your own account: {exc}"
             failure(f".gen stopped: {exc}")
             break
         if result is None:
-            stopped = "no worker could create a channel"
+            stopped = "every ready worker was refused by Telegram"
             break
         made.append(result)
         report = "\n".join([f"{result.title}", result.link, *result.report])
         success(f"{result.title}: {result.link}")
         with contextlib.suppress(Exception):
-            await client.send_message("me", report, link_preview=False)
+            await client.send_message("me", report, **PLAIN)
         if number < count:
             await asyncio.sleep(GEN_DELAY)
 
@@ -1045,7 +1181,15 @@ async def command_gen(
         lines.append(f"No copy of {name} was made.")
     if stopped:
         lines += ["", f"Stopped: {stopped}"]
+    if refused:
+        lines += ["", f"Set aside during this run ({len(refused)}):"]
+        lines += [f"  {worker}: {reason}" for worker, reason in refused[:10]]
     lines += ["", f"Workers: {free} ready, {used} spent, {aside} aside"]
+    if not free and aside:
+        lines.append(
+            "Every worker is set aside. Add fresh accounts with .login, or "
+            "retry the set-aside ones with .reset all."
+        )
     if made:
         lines.append("Full reports are in Saved Messages.")
     await set_status(event, "\n".join(lines))
@@ -1060,13 +1204,15 @@ async def _gen_once(
     source: types.Channel,
     plan: ClonePlan,
     status: Callable[[str], Awaitable[None]],
+    refused: list[tuple[str, str]],
 ) -> MadeChat | None:
     """Make one copy, moving on to another worker while any are left.
 
-    A worker that cannot create the channel is set aside and the next one is
-    tried. OperatorBlocked is passed up, because it would stop every worker the
-    same way. A worker is marked used as soon as its channel exists, since the
-    channel quota is spent whether or not every post copies.
+    A worker Telegram refuses is set aside with the reason and the next one is
+    tried, which is the whole point of a pool. Only OperatorBlocked is passed
+    up, because that would stop every worker the same way. A worker is marked
+    used as soon as its channel exists, since the channel quota is spent
+    whether or not every post copies.
     """
     while True:
         worker = state.pick()
@@ -1076,16 +1222,16 @@ async def _gen_once(
             made = await make_one_copy(
                 client, operator_id, worker, api_id, api_hash, source, plan, status
             )
-        except WorkerUnusable as exc:
-            worker.disabled = str(exc)
-            state.save()
-            warning(f"{worker.name} set aside: {exc}. Trying another worker.")
-            continue
         except OperatorBlocked:
             raise
-        except Exception as exc:  # noqa: BLE001  Keep the worker, report the failure.
-            failure(f"{worker.name} could not make the copy: {exc}")
-            raise OperatorBlocked(f"the copy failed ({exc})") from exc
+        except Exception as exc:  # noqa: BLE001  Any refusal is this worker's.
+            reason = why_unusable(exc)
+            worker.disabled = reason
+            state.save()
+            refused.append((worker.name, reason))
+            warning(f"{worker.name} set aside: {reason}. Trying another worker.")
+            await status(f"{worker.name} refused ({reason}); trying another worker...")
+            continue
 
         worker.used = True
         worker.made.append(made.to_json())
@@ -1110,7 +1256,7 @@ class StatusElsewhere:
 
     async def edit(self, text: str, **kwargs: Any) -> Any:
         """Edit the stand-in status message."""
-        return await self._status.edit(text, **kwargs)
+        return await self._status.edit(text, **{**PLAIN, **kwargs})
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._event, name)
@@ -1130,7 +1276,7 @@ async def keep_out_of_source(client: TelegramClient, state: AutoState, event: An
         await event.delete()
     # The account itself reads its Saved Messages; an admin gets a DM.
     where = "me" if getattr(event, "out", False) else event.sender_id
-    status_message = await client.send_message(where, f".{name}: working...")
+    status_message = await client.send_message(where, f".{name}: working...", **PLAIN)
     return StatusElsewhere(event, status_message)
 
 
@@ -1140,8 +1286,8 @@ COMMAND_HELP = (
     ".gen [count]           make copies of the demo channel\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
     ".accounts              list the workers and the demo channel\n"
-    ".reset [name|all]      mark workers unused again\n"
-    ".remove <name>         forget a worker and its session\n"
+    ".reset [name|all]      free spent and set-aside workers\n"
+    ".remove <name|aside|all>  forget workers and their sessions\n"
     ".cancel                stop a login that is waiting\n"
     + GATE_HELP + "\n"
     ".help                  show this list"

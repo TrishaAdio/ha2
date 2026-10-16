@@ -238,8 +238,8 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 .gen [count]           make copies of the demo channel
 .login [phone]         add a worker account (phone, code, 2FA)
 .accounts              list the workers and the demo channel
-.reset [name|all]      mark workers unused again
-.remove <name>         forget a worker and its session
+.reset [name|all]      free spent and set-aside workers
+.remove <name|aside|all>  forget workers and their sessions
 .cancel                stop a login that is waiting
 .allow / .deny / .admins   who else may send these commands
 .help                  show the list
@@ -274,7 +274,7 @@ Your account does the posting, so premium emoji come through. The worker spends 
 
 ## When something goes wrong
 
-- **The worker can't create the channel** (dead session, banned, channel limit reached, or a flood wait over `AUTOMAKER_MAX_WAIT`, default 300s): it is set aside with the reason and **the next worker is tried**. `.accounts` shows the reasons, and `.reset` puts a worker back.
+- **Telegram refuses the worker** — a frozen account, a spam-limited one, a dead session, the channel limit reached, no admin rights handed over, or a flood wait over `AUTOMAKER_MAX_WAIT` (default 300s). The worker is set aside with the reason and **the next worker is tried**, however many it takes. The `.gen` reply lists every worker set aside during the run and why. `.accounts` shows the reasons later, `.reset all` retries them, and `.remove aside` forgets them.
 - **Your account can't join or be made admin**: the empty channel is deleted again and `.gen` stops. Another worker would hit the same problem and spend its limit too, so it isn't tried. The worker stays unused.
 - **A post fails during the copy**: the copy is kept and handed over. The report names the post by number, as with `.clone`.
 

@@ -1227,6 +1227,13 @@ def rewrite_message_text(
     )
 
 
+# Telethon parses what it sends as Markdown by default, which is wrong for
+# every status and report this tool writes: the asterisks in a masked phone
+# number were read as bold and eaten, so +91********53 was shown as +9153, and
+# an underscore in a chat title would italicise the rest of the line.
+PLAIN: dict[str, object] = {"parse_mode": None, "link_preview": False}
+
+
 async def set_status(event: object, text: str) -> None:
     """Show a command's progress, ignoring failures.
 
@@ -1236,14 +1243,14 @@ async def set_status(event: object, text: str) -> None:
     """
     with contextlib.suppress(Exception):  # Status must never break the command.
         if getattr(event, "out", True):
-            await event.edit(text)
+            await event.edit(text, **PLAIN)
             return
         reply = getattr(event, "status_reply", None)
         if reply is None:
-            event.status_reply = await event.reply(text, link_preview=False)
+            event.status_reply = await event.reply(text, **PLAIN)
             return
         try:
-            await reply.edit(text, link_preview=False)
+            await reply.edit(text, **PLAIN)
         except errors.MessageNotModifiedError:
             pass
 
@@ -2768,7 +2775,7 @@ async def command_clone(client: TelegramClient, event: object, args: list[str]) 
 
     saved = True
     try:
-        await retry_on_wait(client.send_message, "me", report, link_preview=False)
+        await retry_on_wait(client.send_message, "me", report, **PLAIN)
     except Exception as exc:  # noqa: BLE001
         saved = False
         failure(f"Could not save the invite link to Saved Messages: {exc}")

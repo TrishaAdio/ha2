@@ -8,6 +8,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
     .remove <name>            forget a worker and its session
+    .terminate [name|all]     log every other device out of the workers
     .cancel                   abort a login that is waiting for an answer
     .help                     show the list
 
@@ -517,6 +518,27 @@ async def worker_client(
         await client.disconnect()
         raise WorkerUnusable(f"it could not connect ({exc})") from exc
     return client
+
+
+async def terminate_other_logins(
+    worker: Worker, api_id: int, api_hash: str
+) -> None:
+    """Log every other device out of one worker account.
+
+    Connects the worker's stored session and asks Telegram to reset all other
+    authorizations, which terminates every login on the account except this
+    one. Any unauthorized session signed in to the worker is kicked out, so the
+    pool is left holding the only key. The worker's own session is untouched.
+    """
+    client = await worker_client(worker, api_id, api_hash)
+    try:
+        await bounded(
+            client,
+            functions.auth.ResetAuthorizationsRequest(),
+            label="terminate the other logins",
+        )
+    finally:
+        await client.disconnect()
 
 
 async def create_chat(
@@ -1098,6 +1120,65 @@ async def command_remove(
     await set_status(event, "\n".join(lines))
 
 
+async def command_terminate(
+    _client: TelegramClient,
+    state: AutoState,
+    event: Any,
+    args: list[str],
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Terminate every other login on the worker accounts.
+
+    ".terminate all" walks every worker; ".terminate <name>" does one. For each
+    it connects the stored session and asks Telegram to reset all other
+    authorizations, so any login into that account other than the pool's own is
+    terminated. Each worker keeps only the session the pool controls; the
+    stored session is not touched, so .gen can still use it afterwards.
+    """
+    if not state.workers:
+        await set_status(event, "No workers yet. Add one with .login.")
+        return
+
+    target = " ".join(args).strip() or "all"
+    if target.lower() == "all":
+        workers = list(state.workers)
+    else:
+        one = state.find(target)
+        if one is None:
+            await set_status(event, f"No worker matches {target!r}. Check .accounts.")
+            return
+        workers = [one]
+
+    await set_status(
+        event, f"Terminating other logins on {len(workers)} worker(s)..."
+    )
+    cleared: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for worker in workers:
+        try:
+            await terminate_other_logins(worker, api_id, api_hash)
+        except Exception as exc:  # noqa: BLE001  One account must not stop the rest.
+            reason = why_unusable(exc)
+            failed.append((worker.name, reason))
+            warning(f"{worker.name}: could not terminate other logins ({reason}).")
+            continue
+        cleared.append(f"{worker.name} ({worker.label})")
+        success(f"{worker.name}: other logins terminated.")
+
+    lines: list[str] = []
+    if cleared:
+        lines.append(f"Terminated other logins on {len(cleared)} worker(s):")
+        lines += [f"  {entry}" for entry in cleared[:12]]
+        lines.append("Only the pool's own session is left signed in on each.")
+    if failed:
+        lines.append(f"Could not do {len(failed)} worker(s):")
+        lines += [f"  {name}: {reason}" for name, reason in failed[:12]]
+    if not lines:
+        lines.append("Nothing to do.")
+    await set_status(event, "\n".join(lines))
+
+
 async def command_gen(
     client: TelegramClient,
     state: AutoState,
@@ -1288,13 +1369,14 @@ COMMAND_HELP = (
     ".accounts              list the workers and the demo channel\n"
     ".reset [name|all]      free spent and set-aside workers\n"
     ".remove <name|aside|all>  forget workers and their sessions\n"
+    ".terminate <name|all>  log every other device out of the workers\n"
     ".cancel                stop a login that is waiting\n"
     + GATE_HELP + "\n"
     ".help                  show this list"
 )
 
-# Commands that need the API credentials to sign a worker in.
-WITH_CREDENTIALS = {"login", "gen"}
+# Commands that need the API credentials to sign in to a worker account.
+WITH_CREDENTIALS = {"login", "gen", "terminate"}
 COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "set": command_set,
     "login": command_login,
@@ -1302,6 +1384,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "accounts": command_accounts,
     "reset": command_reset,
     "remove": command_remove,
+    "terminate": command_terminate,
 }
 
 

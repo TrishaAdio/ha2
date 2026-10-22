@@ -69,6 +69,8 @@ from colorama import init as colorama_init
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, functions, types, utils
 
+from main import start_client
+
 Result = TypeVar("Result")
 Item = TypeVar("Item")
 Message = Any  # telethon.tl.custom.Message, or types.MessageService
@@ -3193,7 +3195,7 @@ async def main() -> None:
         )
 
     client = TelegramClient(settings.session, settings.api_id, settings.api_hash)
-    await client.start()
+    await start_client(client)
     me = await client.get_me()
     LOG.info("Signed in as %s.", utils.get_display_name(me))
 

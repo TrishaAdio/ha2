@@ -40,6 +40,7 @@ from main import (
     looks_like_index,
     make_index_messages,
     message_link,
+    start_client,
     without_custom_emoji,
 )
 from oho import ColorFormatter
@@ -225,7 +226,7 @@ async def sign_in_all(settings: Settings) -> list[Account]:
         for session in settings.owner_sessions:
             LOG.info("Signing in %r...", session)
             client = TelegramClient(session, settings.api_id, settings.api_hash)
-            await client.start()
+            await start_client(client)
             user = await client.get_me()
             if user is None:
                 raise RuntimeError(f"Session {session!r} is not authorized.")

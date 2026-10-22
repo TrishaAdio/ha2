@@ -25,6 +25,8 @@ from typing import TypeVar, Union
 from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, functions, types, utils
+from telethon.crypto import AuthKey
+from telethon.sessions import StringSession
 from telethon.tl.custom import Dialog, Message
 
 if sys.version_info < (3, 10):
@@ -175,6 +177,117 @@ def read_credentials() -> tuple[int, str, str]:
         raise ValueError("TELEGRAM_API_HASH cannot be empty.")
 
     return api_id, api_hash, session
+
+
+# A Telegram auth key is always 256 bytes, so 512 hex characters.
+AUTH_KEY_BYTES = 256
+# Production Telegram data-centre addresses, used to complete an
+# <auth_key_hex>:<dc_id> session, which carries the key and the data-centre
+# number but no server to reach. A full Telethon StringSession already records
+# its own address and never needs this. These addresses have been stable for
+# years, and Telethon migrates automatically should Telegram ever move one.
+DC_ADDRESSES: dict[int, tuple[str, int]] = {
+    1: ("149.154.175.53", 443),
+    2: ("149.154.167.51", 443),
+    3: ("149.154.175.100", 443),
+    4: ("149.154.167.91", 443),
+    5: ("91.108.56.130", 443),
+}
+# <auth_key_hex>:<dc_id>, the bare form some tools export.
+_AUTH_KEY_DC_RE = re.compile(r"\s*([0-9A-Fa-f]+)\s*:\s*(\d+)\s*\Z")
+
+
+def build_string_session(text: str) -> str:
+    """Turn a pasted session into a Telethon StringSession string.
+
+    Two shapes are accepted, so a session exported by almost anything can be
+    pasted straight in on a machine that never receives a login code:
+
+      * a normal Telethon StringSession, which already carries its data centre
+        and server address, kept as it is; and
+      * <auth_key_hex>:<dc_id>, the bare 256-byte key and data-centre number
+        some tools hand out, completed here with that data centre's address.
+
+    Raises ValueError, with a readable reason, on anything else.
+    """
+    candidate = text.strip()
+    if not candidate:
+        raise ValueError("No session string was given.")
+
+    match = _AUTH_KEY_DC_RE.fullmatch(candidate)
+    if match:
+        try:
+            key = bytes.fromhex(match.group(1))
+        except ValueError as exc:
+            raise ValueError("The auth key is not valid hexadecimal.") from exc
+        if len(key) != AUTH_KEY_BYTES:
+            raise ValueError(
+                f"An auth key is {AUTH_KEY_BYTES} bytes "
+                f"({AUTH_KEY_BYTES * 2} hex characters); this one is {len(key)}."
+            )
+        dc_id = int(match.group(2))
+        address = DC_ADDRESSES.get(dc_id)
+        if address is None:
+            raise ValueError(f"Data centre {dc_id} is not a known Telegram one (1-5).")
+        session = StringSession()
+        session.set_dc(dc_id, address[0], address[1])
+        session.auth_key = AuthKey(key)
+        return session.save()
+
+    # Anything else is treated as an ordinary Telethon StringSession.
+    try:
+        return StringSession(candidate).save()
+    except Exception as exc:  # noqa: BLE001  A malformed string has to say so.
+        raise ValueError(
+            "That is neither a Telethon session string nor the "
+            "auth_key_hex:dc_id form."
+        ) from exc
+
+
+async def start_client(client: TelegramClient) -> TelegramClient:
+    """Connect and make sure the account is logged in, then return the client.
+
+    An already-authorized session just connects and returns, exactly as
+    client.start() did. Otherwise the terminal offers two ways in: paste an
+    existing session string, which needs no login code and so works on a server
+    where the code never arrives, or press Enter to log in with a phone number
+    and a code as before.
+    """
+    await client.connect()
+    if await client.is_user_authorized():
+        return client
+
+    info("This session is not logged in yet.")
+    info("Paste a session string to log in without a code (a Telethon")
+    info("StringSession, or the auth_key_hex:dc_id form), or press Enter")
+    info("to log in with your phone number and a code.")
+    while True:
+        pasted = input(
+            Fore.CYAN + "Session string (or Enter for phone login): "
+        ).strip()
+        if not pasted:
+            await client.start()  # The usual phone-number-and-code flow.
+            return client
+        try:
+            serialized = build_string_session(pasted)
+        except ValueError as exc:
+            failure(str(exc))
+            continue
+        # Import the pasted session into this session file, so the next run
+        # connects straight away without asking again.
+        source = StringSession(serialized)
+        await client.disconnect()
+        client.session.set_dc(source.dc_id, source.server_address, source.port)
+        client.session.auth_key = source.auth_key
+        client.session.save()
+        await client.connect()
+        if await client.is_user_authorized():
+            success("Logged in from the session string.")
+            return client
+        failure(
+            "Telegram rejected that session string (it is dead, revoked, or was "
+            "never authorized). Paste another, or press Enter for phone login."
+        )
 
 
 async def retry_on_wait(
@@ -2885,7 +2998,7 @@ async def main() -> None:
     api_id, api_hash, session = read_credentials()
     info("Connecting to Telegram...")
     client = TelegramClient(session, api_id, api_hash)
-    await client.start()
+    await start_client(client)
     success("Telegram account connected.")
     try:
         mode = choose_mode()

@@ -34,6 +34,7 @@ from colorama import Fore, Style, init as colorama_init
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, functions, types, utils
 
+from main import start_client
 from oho import ColorFormatter, resilient
 
 LOG = logging.getLogger("iam")
@@ -766,7 +767,7 @@ async def main() -> None:
     api_id, api_hash, session = read_credentials()
     LOG.info("Connecting as the new account (session %r)...", session)
     client = TelegramClient(session, api_id, api_hash)
-    await client.start()
+    await start_client(client)
     me = await client.get_me()
     LOG.info(
         "Connected as %s%s.",

@@ -31,6 +31,8 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.tl.custom import Dialog, Message
 
+from main import start_client
+
 ChatEntity = Union[types.Channel, types.Chat]
 Result = TypeVar("Result")
 
@@ -408,7 +410,7 @@ async def sign_in(session: str, settings: Settings, role: str) -> Account:
     """Sign a session in, prompting for the login code when needed."""
     LOG.info("Signing in %s account from session %r...", role, session)
     client = TelegramClient(session, settings.api_id, settings.api_hash)
-    await client.start()
+    await start_client(client)
     user = await client.get_me()
     if user is None:
         raise RuntimeError(f"Session {session!r} is not authorized.")

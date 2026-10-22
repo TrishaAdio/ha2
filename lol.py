@@ -30,6 +30,8 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, types, utils
 from telethon.tl.custom import Dialog, Message
 
+from main import start_client
+
 # Logging setup and the resilient request helper already live in oho.py.
 from oho import ColorFormatter, resilient
 
@@ -590,7 +592,7 @@ async def main() -> None:
     api_id, api_hash, session = read_credentials()
     LOG.info("Connecting to Telegram...")
     client = TelegramClient(session, api_id, api_hash)
-    await client.start()
+    await start_client(client)
     me = await client.get_me()
     LOG.info("Connected as %s.", chat_name(me) if me else "unknown")
     try:

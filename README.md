@@ -199,7 +199,14 @@ TELEGRAM_SESSION=channel_copier
 python main.py
 ```
 
-On the first run, Telethon asks for your Telegram phone number, login code, and two-step verification password if enabled. The script then:
+On the first run the account has to be logged in. The terminal offers two ways:
+
+- **Paste a session string** — press nothing else, just paste an existing session when asked. A normal Telethon `StringSession` works, and so does the bare `auth_key_hex:dc_id` form some tools export. This needs no login code, so it is the way to log in on a **VPS or server where Telegram never delivers the code** (Telegram often refuses to send login codes to datacentre IPs). The session is imported into the local session file, so later runs connect straight away.
+- **Phone number and code** — press Enter at that prompt to log in the usual way, with your phone number, the login code, and your two-step verification password if enabled.
+
+All of the scripts here (`main.py`, `oho.py`, `iam.py`, `lol.py`, `redirect.py`, `reindex.py`) share this login step, so a session string can be pasted for any of them.
+
+After login, the script then:
 
 1. Shows available channels and groups and asks for the source.
 2. Asks which source topic to read when the source is a forum group.

@@ -86,6 +86,10 @@ PASSWORD_ATTEMPTS = 3
 
 PHONE_RE = re.compile(r"^\+?\d[\d\s\-().]{5,22}$")
 INVITE_HASH_RE = re.compile(r"t\.me/(?:joinchat/|\+)([\w-]+)", re.IGNORECASE)
+# A fresh channel takes a moment to propagate; retry the join and member
+# lookup this many times, waiting JOIN_RETRY_DELAY * attempt seconds between.
+JOIN_RETRIES = 4
+JOIN_RETRY_DELAY = 3
 CANCEL_WORDS = frozenset({".cancel", "cancel", ".stop", "stop", ".abort"})
 # Telegram answers a dead or revoked session with one of these, and no amount
 # of retrying brings it back; the worker has to be re-added with .login.
@@ -672,11 +676,21 @@ async def operator_joins(
     invite = invite_hash_of(link)
 
     try:
-        joined = await bounded(
-            operator,
-            functions.messages.ImportChatInviteRequest(hash=invite),
-            label="join the new channel",
-        )
+        # A brand-new channel and its link can take a few seconds to reach
+        # every Telegram server, and until then the link reads as expired.
+        for attempt in range(JOIN_RETRIES):
+            try:
+                joined = await bounded(
+                    operator,
+                    functions.messages.ImportChatInviteRequest(hash=invite),
+                    label="join the new channel",
+                )
+                break
+            except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+                if attempt == JOIN_RETRIES - 1:
+                    raise
+                warning(f"The new invite link is not live yet; retrying ({attempt + 1})...")
+                await asyncio.sleep(JOIN_RETRY_DELAY * (attempt + 1))
         return channel_from_updates(joined)
     except errors.UserAlreadyParticipantError:
         checked = await operator(functions.messages.CheckChatInviteRequest(hash=invite))
@@ -719,25 +733,34 @@ async def promote_operator(
     just joined, so it is in there. Without admin rights the operator could not
     post a single message, so a failure here sets the worker aside.
     """
-    participants = await bounded(
-        worker,
-        functions.channels.GetParticipantsRequest(
-            channel=channel,
-            filter=types.ChannelParticipantsRecent(),
-            offset=0,
-            limit=100,
-            hash=0,
-        ),
-        label="read the member list",
-    )
-    found = next(
-        (
-            user
-            for user in getattr(participants, "users", None) or []
-            if getattr(user, "id", None) == operator_id
-        ),
-        None,
-    )
+    # The member list can lag a few seconds behind the join, so look again
+    # before giving up on the worker.
+    found = None
+    for attempt in range(JOIN_RETRIES):
+        participants = await bounded(
+            worker,
+            functions.channels.GetParticipantsRequest(
+                channel=channel,
+                filter=types.ChannelParticipantsRecent(),
+                offset=0,
+                limit=100,
+                hash=0,
+            ),
+            label="read the member list",
+        )
+        found = next(
+            (
+                user
+                for user in getattr(participants, "users", None) or []
+                if getattr(user, "id", None) == operator_id
+            ),
+            None,
+        )
+        if found is not None:
+            break
+        if attempt < JOIN_RETRIES - 1:
+            warning(f"Your account is not in the member list yet; retrying ({attempt + 1})...")
+            await asyncio.sleep(JOIN_RETRY_DELAY * (attempt + 1))
     if found is None:
         raise WorkerUnusable("it cannot see your account among the new members")
 

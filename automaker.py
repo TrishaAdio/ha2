@@ -684,6 +684,15 @@ async def operator_joins(
         if isinstance(existing, types.Channel):
             return existing
         raise OperatorBlocked("joined, but the channel could not be read back") from None
+    except (errors.InviteHashExpiredError, errors.InviteHashInvalidError) as exc:
+        # The link was exported a moment ago, so it cannot really have
+        # expired: Telegram says this when the worker's new channel is no
+        # longer valid, usually because the worker is spam-limited and its
+        # channel was restricted or removed. That is the worker's problem,
+        # so set it aside and let .gen try the next one.
+        raise WorkerUnusable(
+            f"Telegram rejected the fresh invite link to its channel ({why_unusable(exc)})"
+        ) from exc
     except errors.ChannelsTooMuchError as exc:
         raise OperatorBlocked(
             "your account is in as many channels as Telegram allows; leave some"

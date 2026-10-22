@@ -4,6 +4,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
 
     .set [link]               choose the demo channel that .gen copies
     .login [phone]            add a worker account, by phone, code and 2FA
+    .session [string]         add a worker from a session string, no code
     .gen [count]              make that many copies of the demo channel
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
@@ -47,6 +48,7 @@ from typing import Any, Awaitable, Callable
 
 from colorama import Fore, Style
 from telethon import TelegramClient, errors, events, functions, types, utils
+from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
 from main import (
@@ -96,9 +98,77 @@ DEAD_SESSION_ERRORS = (
     errors.UserDeactivatedBanError,
 )
 
+# A Telegram auth key is always 256 bytes, so 512 hex characters.
+AUTH_KEY_BYTES = 256
+# Production Telegram data-centre addresses, used to complete an
+# <auth_key_hex>:<dc_id> session, which carries the key and the data-centre
+# number but no server to reach. A full Telethon StringSession already records
+# its own address, so it never needs this table. These addresses have been
+# stable for years; Telethon migrates automatically if Telegram ever moves one.
+DC_ADDRESSES: dict[int, tuple[str, int]] = {
+    1: ("149.154.175.53", 443),
+    2: ("149.154.167.51", 443),
+    3: ("149.154.175.100", 443),
+    4: ("149.154.167.91", 443),
+    5: ("91.108.56.130", 443),
+}
+# <auth_key_hex>:<dc_id>, the bare form some tools export.
+AUTH_KEY_DC_RE = re.compile(r"\s*([0-9A-Fa-f]+)\s*:\s*(\d+)\s*\Z")
+
 
 class LoginAborted(Exception):
     """The operator cancelled a login, or stopped answering."""
+
+
+def build_string_session(text: str) -> str:
+    """Turn a pasted session into a Telethon StringSession string.
+
+    Two shapes are accepted, so a session exported by almost anything can be
+    pasted straight in on a server that never receives a login code:
+
+      * a normal Telethon StringSession, which already carries its data centre
+        and server address, kept as it is; and
+      * <auth_key_hex>:<dc_id>, the bare 256-byte key and data-centre number
+        some tools hand out, completed here with that data centre's address.
+
+    The returned value is itself a Telethon StringSession string, which is what
+    every worker stores and what worker_client() reconnects with.
+    """
+    candidate = text.strip()
+    if not candidate:
+        raise LoginAborted("no session string was given")
+
+    match = AUTH_KEY_DC_RE.fullmatch(candidate)
+    if match:
+        hex_key, dc_text = match.group(1), match.group(2)
+        try:
+            key = bytes.fromhex(hex_key)
+        except ValueError as exc:
+            raise LoginAborted("the auth key is not valid hex") from exc
+        if len(key) != AUTH_KEY_BYTES:
+            raise LoginAborted(
+                f"an auth key is {AUTH_KEY_BYTES} bytes ({AUTH_KEY_BYTES * 2} hex "
+                f"characters); this one is {len(key)}"
+            )
+        dc_id = int(dc_text)
+        address = DC_ADDRESSES.get(dc_id)
+        if address is None:
+            raise LoginAborted(
+                f"data centre {dc_id} is not a known Telegram one (expected 1-5)"
+            )
+        session = StringSession()
+        session.set_dc(dc_id, address[0], address[1])
+        session.auth_key = AuthKey(key)
+        return session.save()
+
+    # Anything else is treated as an ordinary Telethon StringSession.
+    try:
+        return StringSession(candidate).save()
+    except Exception as exc:  # noqa: BLE001  A malformed string has to say so.
+        raise LoginAborted(
+            "that is neither a Telethon session string nor the "
+            "<auth_key_hex>:<dc_id> form"
+        ) from exc
 
 
 class WorkerUnusable(Exception):
@@ -868,6 +938,62 @@ async def command_login(
             await set_status(event, f"Login stopped: {exc}")
 
 
+async def command_session(
+    client: TelegramClient,
+    state: AutoState,
+    event: Any,
+    args: list[str],
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Add a worker from a pasted session string, with no code or 2FA.
+
+    This is how a worker is added on a server that never receives the login
+    code: the account is signed in somewhere that can get the code, its session
+    is pasted here, and it joins the pool at once. A normal Telethon
+    StringSession works, and so does the bare <auth_key_hex>:<dc_id> form.
+
+    The string is full access to the account, exactly as sensitive as the
+    password, so it is deleted the moment it has been read.
+    """
+    async with Conversation(client, event) as convo:
+        try:
+            raw = (
+                " ".join(args).strip()
+                if args
+                else await convo.ask(
+                    "Send the session string.\n\n"
+                    "A Telethon StringSession, or the <auth_key_hex>:<dc_id> form. "
+                    "It is full access to the account, so it is deleted as soon "
+                    "as it is read.",
+                    secret=True,
+                )
+            )
+            # Overwrite the command message straight away: when the string is
+            # typed inline as .session <string>, this is what takes it out of
+            # the chat history.
+            await convo.say("Checking the session with Telegram...")
+            serialized = build_string_session(raw)
+            worker = TelegramClient(StringSession(serialized), api_id, api_hash)
+            await worker.connect()
+            try:
+                if not await worker.is_user_authorized():
+                    raise LoginAborted(
+                        "Telegram rejected that session; it is dead, revoked, or "
+                        "never authorized"
+                    )
+                await _store_worker(convo, worker, state, phone="")
+            finally:
+                await worker.disconnect()
+        except LoginAborted as exc:
+            warning(f"Could not add the session: {exc}")
+            await set_status(event, f"Could not add the session: {exc}")
+        except Exception as exc:  # noqa: BLE001  A bad session must not stop the mode.
+            reason = short_error(exc)
+            warning(f"Could not add the session: {reason}")
+            await set_status(event, f"Could not add the session: {reason}")
+
+
 async def _sign_worker_in(
     convo: Conversation, worker: TelegramClient, state: AutoState, phone: str
 ) -> None:
@@ -946,6 +1072,11 @@ async def _store_worker(
         raise LoginAborted("Telegram accepted the login but returned no account")
     if getattr(me, "bot", False):
         raise LoginAborted("that is a bot account, which cannot create chats")
+
+    # A session added with .session carries no phone of its own, so the
+    # account's own number is used when Telegram still exposes it.
+    if not phone and getattr(me, "phone", None):
+        phone = f"+{me.phone}"
 
     existing = next(
         (item for item in state.workers if item.user_id == me.id), None
@@ -1366,6 +1497,7 @@ COMMAND_HELP = (
     ".set [link]            choose the demo channel (send it in the channel)\n"
     ".gen [count]           make copies of the demo channel\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
+    ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".reset [name|all]      free spent and set-aside workers\n"
     ".remove <name|aside|all>  forget workers and their sessions\n"
@@ -1376,10 +1508,11 @@ COMMAND_HELP = (
 )
 
 # Commands that need the API credentials to sign in to a worker account.
-WITH_CREDENTIALS = {"login", "gen", "terminate"}
+WITH_CREDENTIALS = {"login", "session", "gen", "terminate"}
 COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "set": command_set,
     "login": command_login,
+    "session": command_session,
     "gen": command_gen,
     "accounts": command_accounts,
     "reset": command_reset,
@@ -1427,7 +1560,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
 
         args = raw_args.split() if raw_args else []
         async with busy:
-            if name == "login":
+            if name in {"login", "session"}:
                 awaiting.add(event.chat_id)
             try:
                 if name in {"set", "gen"}:

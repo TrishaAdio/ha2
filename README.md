@@ -268,7 +268,7 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 
 1. Picks a **random worker that has not been used yet**.
 2. The worker creates an empty channel with the **same name and the same kind** (channel or group) as the demo channel.
-3. Your account joins it by invite link and the worker promotes it to admin. The worker's job ends here.
+3. Your account joins it by invite link and the worker promotes it to admin. The worker also adds **@DemoSaviourBot** as an admin with full rights (set `AUTOMAKER_ADMIN_BOT` in `.env` to use another bot; left empty, it uses @DemoSaviourBot). If the bot can't be added, the copy still goes ahead and the report says why. The worker's job ends here.
 4. **Your account** then copies the demo channel into it, exactly as `.clone` does:
    - profile photo and description
    - every post one by one in order, with its markdown, links, premium emoji, albums and spoilers

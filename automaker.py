@@ -6,7 +6,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .login [phone]            add a worker account, by phone, code and 2FA
     .session [string]         add a worker from a session string, no code
     .gen [count]              make that many copies of the demo channel
-    .delete [link]            delete every post in a copy, never the demo
+    .delete [link]            delete a copy and free its worker, never the demo
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
     .remove <name>            forget a worker and its session
@@ -1059,12 +1059,19 @@ async def command_set(
 
 
 async def command_delete(
-    client: TelegramClient, state: AutoState, event: Any, args: list[str]
+    client: TelegramClient,
+    state: AutoState,
+    event: Any,
+    args: list[str],
+    api_id: int,
+    api_hash: str,
 ) -> None:
-    """Delete every post in a cloned channel or group (never the demo channel).
+    """Delete a channel made by .gen and give its worker back to the pool.
 
-    Sent inside the copy it empties that chat; with a link, invite or @handle
-    it empties that one, which is how it is used from a DM.
+    Sent inside the copy it deletes that one; with a link, invite or @handle it
+    deletes that one. The demo channel set with .set is never touched. The
+    worker that created the copy owns it, so the worker deletes it, and is then
+    marked unused again so .gen can pick it once more.
     """
     if args and looks_like_chat_reference(args[0]):
         try:
@@ -1085,33 +1092,48 @@ async def command_delete(
         await set_status(event, "That is not a channel or group.")
         return
     if state.source_id is not None and utils.get_peer_id(chat) == state.source_id:
-        await set_status(event, "That is the demo channel set with .set; it is never emptied.")
+        await set_status(event, "That is the demo channel set with .set; it is never deleted.")
         return
 
     title = utils.get_display_name(chat) or str(chat.id)
-    # The command itself is in the chat being emptied, so report elsewhere.
+    owner = next(
+        (w for w in state.workers if any(m.get("chat_id") == chat.id for m in w.made)),
+        None,
+    )
+    # The command sits in the chat about to vanish, so report from elsewhere.
     if not args:
         with contextlib.suppress(Exception):
             await event.delete()
         event = await client.send_message("me", f".delete: {title}", **PLAIN)
 
-    await set_fancy(event, f"Deleting every post in {title}...")
-    deleted = 0
-    batch: list[int] = []
-    async for message in client.iter_messages(chat):
-        if message.id == 1 and isinstance(message.action, types.MessageActionChannelCreate):
-            continue  # The creation notice cannot be deleted.
-        batch.append(message.id)
-        if len(batch) == 100:
-            await client.delete_messages(chat, batch)
-            deleted += len(batch)
-            batch = []
-            await set_fancy(event, f"Deleting every post in {title}... {deleted}")
-    if batch:
-        await client.delete_messages(chat, batch)
-        deleted += len(batch)
-    success(f"Emptied {title}: {deleted} message(s) deleted.")
-    await set_fancy(event, f"Deleted {deleted} post(s) from {title}.", done=True)
+    await set_fancy(event, f"Deleting {title}...")
+    try:
+        if owner is None:
+            # Not made by a known worker: only works if this account owns it.
+            await client(functions.channels.DeleteChannelRequest(channel=chat))
+        else:
+            worker = await worker_client(owner, api_id, api_hash)
+            try:
+                await worker.get_dialogs()  # Teaches it the channel's access hash.
+                own = await worker.get_input_entity(types.PeerChannel(chat.id))
+                await worker(functions.channels.DeleteChannelRequest(channel=own))
+            finally:
+                await worker.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        failure(f"Could not delete {title}: {exc}")
+        await set_status(event, f"Could not delete {title}: {short_error(exc)}")
+        return
+
+    lines = [f"Deleted {title}."]
+    if owner is not None:
+        owner.made = [m for m in owner.made if m.get("chat_id") != chat.id]
+        owner.used = False
+        state.save()
+        lines.append(f"{owner.name} is ready again.")
+    else:
+        lines.append("No worker made it, so no worker was freed.")
+    success(" ".join(lines))
+    await set_fancy(event, "\n".join(lines), done=True)
 
 
 async def command_login(
@@ -1700,7 +1722,7 @@ COMMAND_HELP = (
     "Auto maker\n"
     ".set [link]            choose the demo channel (send it in the channel)\n"
     ".gen [count]           make copies of the demo channel\n"
-    ".delete [link]         delete every post in a copy (not the demo)\n"
+    ".delete [link]         delete a copy, free its worker (not the demo)\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
@@ -1713,7 +1735,7 @@ COMMAND_HELP = (
 )
 
 # Commands that need the API credentials to sign in to a worker account.
-WITH_CREDENTIALS = {"login", "session", "gen", "terminate"}
+WITH_CREDENTIALS = {"login", "session", "gen", "terminate", "delete"}
 COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "set": command_set,
     "login": command_login,

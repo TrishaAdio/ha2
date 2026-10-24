@@ -6,6 +6,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .login [phone]            add a worker account, by phone, code and 2FA
     .session [string]         add a worker from a session string, no code
     .gen [count]              make that many copies of the demo channel
+    .delete [link]            delete every post in a copy, never the demo
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
     .remove <name>            forget a worker and its session
@@ -96,6 +97,37 @@ INVITE_HASH_RE = re.compile(r"t\.me/(?:joinchat/|\+)([\w-]+)", re.IGNORECASE)
 # lookup this many times, waiting JOIN_RETRY_DELAY * attempt seconds between.
 JOIN_RETRIES = 4
 JOIN_RETRY_DELAY = 3
+
+
+# Premium custom emoji shown on .gen progress: an hourglass while working and
+# a check mark when done. The text after the emoji is bold.
+WORKING_EMOJI = ("\u23f3", 6113844439292054570)
+DONE_EMOJI = ("\u2705", 5411197345968701560)
+
+
+def _utf16(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+async def set_fancy(event: Any, text: str, done: bool = False) -> None:
+    """Like set_status, but with a custom emoji in front and the text in bold."""
+    emoji, emoji_id = DONE_EMOJI if done else WORKING_EMOJI
+    full = f"{emoji} {text}"
+    entities = [
+        types.MessageEntityCustomEmoji(offset=0, length=_utf16(emoji), document_id=emoji_id),
+        types.MessageEntityBold(offset=_utf16(emoji) + 1, length=_utf16(text)),
+    ]
+    kwargs = {"link_preview": False, "formatting_entities": entities}
+    with contextlib.suppress(Exception):
+        if getattr(event, "out", True):
+            await event.edit(full, **kwargs)
+            return
+        reply = getattr(event, "status_reply", None)
+        if reply is None:
+            event.status_reply = await event.reply(full, **kwargs)
+            return
+        with contextlib.suppress(errors.MessageNotModifiedError):
+            await reply.edit(full, **kwargs)
 CANCEL_WORDS = frozenset({".cancel", "cancel", ".stop", "stop", ".abort"})
 # Telegram answers a dead or revoked session with one of these, and no amount
 # of retrying brings it back; the worker has to be re-added with .login.
@@ -1026,6 +1058,62 @@ async def command_set(
     )
 
 
+async def command_delete(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """Delete every post in a cloned channel or group (never the demo channel).
+
+    Sent inside the copy it empties that chat; with a link, invite or @handle
+    it empties that one, which is how it is used from a DM.
+    """
+    if args and looks_like_chat_reference(args[0]):
+        try:
+            chat = await resolve_clone_source(client, args[0])
+        except Exception as exc:  # noqa: BLE001
+            await set_status(event, f"Cannot use {args[0]}: {exc}")
+            return
+    elif args:
+        await set_status(event, f"{args[0]} is not a channel link, invite or @handle.")
+        return
+    elif getattr(event, "is_private", False):
+        await set_status(event, "Send .delete inside the copy, or .delete <link to it>.")
+        return
+    else:
+        chat = await event.get_chat()
+
+    if not isinstance(chat, types.Channel):
+        await set_status(event, "That is not a channel or group.")
+        return
+    if state.source_id is not None and utils.get_peer_id(chat) == state.source_id:
+        await set_status(event, "That is the demo channel set with .set; it is never emptied.")
+        return
+
+    title = utils.get_display_name(chat) or str(chat.id)
+    # The command itself is in the chat being emptied, so report elsewhere.
+    if not args:
+        with contextlib.suppress(Exception):
+            await event.delete()
+        event = await client.send_message("me", f".delete: {title}", **PLAIN)
+
+    await set_fancy(event, f"Deleting every post in {title}...")
+    deleted = 0
+    batch: list[int] = []
+    async for message in client.iter_messages(chat):
+        if message.id == 1 and isinstance(message.action, types.MessageActionChannelCreate):
+            continue  # The creation notice cannot be deleted.
+        batch.append(message.id)
+        if len(batch) == 100:
+            await client.delete_messages(chat, batch)
+            deleted += len(batch)
+            batch = []
+            await set_fancy(event, f"Deleting every post in {title}... {deleted}")
+    if batch:
+        await client.delete_messages(chat, batch)
+        deleted += len(batch)
+    success(f"Emptied {title}: {deleted} message(s) deleted.")
+    await set_fancy(event, f"Deleted {deleted} post(s) from {title}.", done=True)
+
+
 async def command_login(
     client: TelegramClient,
     state: AutoState,
@@ -1458,7 +1546,7 @@ async def command_gen(
         count = free
 
     name = utils.get_display_name(source)
-    await set_status(event, f"Reading {name}...")
+    await set_fancy(event, f"Reading {name}...")
     # Read once for the whole run: every copy gets the same posts in the same
     # order, and an expired file reference is re-uploaded post by post.
     plan = await collect_clone_posts(client, source, command_id=event.id)
@@ -1475,7 +1563,7 @@ async def command_gen(
         prefix = f"Copy {number}/{count} of {name}: "
 
         async def status(text: str, prefix: str = prefix) -> None:
-            await set_status(event, prefix + text)
+            await set_fancy(event, prefix + text)
 
         try:
             result = await _gen_once(
@@ -1517,7 +1605,10 @@ async def command_gen(
         )
     if made:
         lines.append("Full reports are in Saved Messages.")
-    await set_status(event, "\n".join(lines))
+    if made:
+        await set_fancy(event, "\n".join(lines), done=True)
+    else:
+        await set_status(event, "\n".join(lines))
 
 
 async def _gen_once(
@@ -1609,6 +1700,7 @@ COMMAND_HELP = (
     "Auto maker\n"
     ".set [link]            choose the demo channel (send it in the channel)\n"
     ".gen [count]           make copies of the demo channel\n"
+    ".delete [link]         delete every post in a copy (not the demo)\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
@@ -1627,6 +1719,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "login": command_login,
     "session": command_session,
     "gen": command_gen,
+    "delete": command_delete,
     "accounts": command_accounts,
     "reset": command_reset,
     "remove": command_remove,
@@ -1676,7 +1769,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
             if name in {"login", "session"}:
                 awaiting.add(event.chat_id)
             try:
-                if name in {"set", "gen"}:
+                if name in {"set", "gen", "delete"}:
                     event = await keep_out_of_source(client, state, event, name, args)
                 if name in WITH_CREDENTIALS:
                     await handler(client, state, event, args, api_id, api_hash)

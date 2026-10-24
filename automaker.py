@@ -81,6 +81,12 @@ MAX_WAIT = float(os.getenv("AUTOMAKER_MAX_WAIT") or 300)
 # Pause between two copies in one .gen run, so a batch does not look automated.
 GEN_DELAY = float(os.getenv("AUTOMAKER_GEN_DELAY") or 8)
 GEN_LIMIT = 20  # Most copies one .gen may make.
+# Bot added as a full admin to every channel .gen creates. AUTOMAKER_ADMIN_BOT
+# in .env picks another one; unset or empty falls back to this default.
+DEFAULT_ADMIN_BOT = "DemoSaviourBot"
+ADMIN_BOT = (
+    (os.getenv("AUTOMAKER_ADMIN_BOT") or "").strip().lstrip("@") or DEFAULT_ADMIN_BOT
+)
 CODE_ATTEMPTS = 3
 PASSWORD_ATTEMPTS = 3
 
@@ -280,6 +286,44 @@ def operator_rights(megagroup: bool) -> types.ChatAdminRights:
         edit_messages=True,
         delete_messages=True,
         invite_users=True,
+        manage_call=True,
+        post_stories=True,
+        edit_stories=True,
+        delete_stories=True,
+        other=True,
+    )
+
+
+def full_rights(megagroup: bool) -> types.ChatAdminRights:
+    """Return every admin right the owner can hand out, for the admin bot.
+
+    Like operator_rights, channels and groups get their own set, since Telegram
+    can refuse a promotion that mixes the two. Unlike the operator, the bot is
+    given add_admins too: it gets full rights. anonymous is left off, so the
+    bot's actions stay visible as its own.
+    """
+    if megagroup:
+        return supported_rights(
+            change_info=True,
+            delete_messages=True,
+            ban_users=True,
+            invite_users=True,
+            pin_messages=True,
+            add_admins=True,
+            manage_call=True,
+            manage_topics=True,
+            post_stories=True,
+            edit_stories=True,
+            delete_stories=True,
+            other=True,
+        )
+    return supported_rights(
+        change_info=True,
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        invite_users=True,
+        add_admins=True,
         manage_call=True,
         post_stories=True,
         edit_stories=True,
@@ -789,6 +833,38 @@ async def promote_operator(
         ) from exc
 
 
+async def add_admin_bot(worker: TelegramClient, channel: types.Channel) -> str:
+    """Add ADMIN_BOT to the new channel as an admin with full rights.
+
+    The worker does this because it owns the channel: only the owner can grant
+    add_admins, which the operator deliberately does not have. Promoting a bot
+    that is not a member adds it at the same time, so no separate invite is
+    needed.
+
+    A failure here does not throw the copy away: the channel and the worker's
+    quota are already spent, so it comes back as a line for the report instead.
+    """
+    if not ADMIN_BOT:
+        return ""
+    try:
+        bot = await worker.get_input_entity(ADMIN_BOT)
+        await bounded(
+            worker,
+            functions.channels.EditAdminRequest(
+                channel=channel,
+                user_id=bot,
+                admin_rights=full_rights(bool(channel.megagroup)),
+                rank="bot" if channel.megagroup else "",
+            ),
+            label=f"add @{ADMIN_BOT} as admin",
+        )
+    except Exception as exc:  # noqa: BLE001  Report it, keep the copy.
+        warning(f"Could not add @{ADMIN_BOT} as admin: {why_unusable(exc)}")
+        return f"@{ADMIN_BOT} was NOT added as admin: {why_unusable(exc)}"
+    success(f"Added @{ADMIN_BOT} as admin with full rights.")
+    return f"@{ADMIN_BOT} added as admin with full rights."
+
+
 JOIN_ACTIONS = (
     types.MessageActionChatJoinedByLink,
     types.MessageActionChatJoinedByRequest,
@@ -850,6 +926,9 @@ async def make_one_copy(
         await status("Joining it and becoming admin...")
         target = await operator_joins(client, operator, channel)
         await promote_operator(client, channel, operator_id)
+        if ADMIN_BOT:
+            await status(f"Adding @{ADMIN_BOT} as admin...")
+        bot_note = await add_admin_bot(client, channel)
     except BaseException:
         if channel is not None:
             await delete_chat(client, channel)
@@ -873,6 +952,8 @@ async def make_one_copy(
     except Exception as exc:  # noqa: BLE001
         failure(f"Could not export an invite link for {title!r}: {exc}")
         link = f"(no invite link: {exc}; export one in the channel's settings)"
+    if bot_note:
+        report = [bot_note, *report]
     return MadeChat(
         chat_id=target.id,
         title=title,

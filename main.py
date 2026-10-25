@@ -1347,26 +1347,15 @@ def rewrite_message_text(
 PLAIN: dict[str, object] = {"parse_mode": None, "link_preview": False}
 
 
-async def set_status(event: object, text: str) -> None:
-    """Show a command's progress, ignoring failures.
+async def set_status(event: object, text: str, icon: str | None = None) -> None:
+    """Show a command's progress with a tgmacicons icon and a bold headline.
 
-    A command this account sent is edited in place. A command an admin sent
-    from another account cannot be edited, since nobody may edit someone else's
-    message, so the first status becomes a reply and later ones edit that reply.
+    The icon is picked from what the text says unless one is named; see
+    icons.py. Failures to edit are ignored, as before.
     """
-    with contextlib.suppress(Exception):  # Status must never break the command.
-        if getattr(event, "out", True):
-            await event.edit(text, **PLAIN)
-            return
-        reply = getattr(event, "status_reply", None)
-        if reply is None:
-            event.status_reply = await event.reply(text, **PLAIN)
-            return
-        try:
-            await reply.edit(text, **PLAIN)
-        except errors.MessageNotModifiedError:
-            pass
+    from icons import set_status as _styled_status
 
+    await _styled_status(event, text, icon)
 
 def message_text(event_or_message: object) -> str:
     """Return the plain text of a NewMessage event or a Message.

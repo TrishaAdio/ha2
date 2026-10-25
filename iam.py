@@ -619,10 +619,7 @@ async def apply_personal_channel(
 # ---------------------------------------------------------------------------
 # command surface
 # ---------------------------------------------------------------------------
-async def set_status(event: object, text: str) -> None:
-    """Replace the command message with a progress line, ignoring failures."""
-    with contextlib.suppress(Exception):
-        await event.edit(text)
+from icons import set_status  # noqa: E402  Icon + bold headline on every status.
 
 
 def preview(snap: Snapshot, bio_limit: int) -> str:

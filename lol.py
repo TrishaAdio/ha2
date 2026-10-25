@@ -16,7 +16,6 @@ Run with `python lol.py`.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import getpass
 import logging
 import os
@@ -431,10 +430,7 @@ async def execute(client: TelegramClient, plan: Plan, event: object) -> DeleteSt
 # ---------------------------------------------------------------------------
 # command surface
 # ---------------------------------------------------------------------------
-async def set_status(event: object, text: str) -> None:
-    """Replace the command message with a progress line, ignoring failures."""
-    with contextlib.suppress(Exception):
-        await event.edit(text)
+from icons import set_status  # noqa: E402  Icon + bold headline on every status.
 
 
 def preview_text(plan: Plan) -> str:

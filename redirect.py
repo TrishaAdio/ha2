@@ -2634,10 +2634,7 @@ COMMAND_HELP = (
 )
 
 
-async def set_status(event: object, text: str) -> None:
-    """Replace the command message with its result."""
-    with contextlib.suppress(Exception):
-        await event.edit(text)
+from icons import set_status  # noqa: E402  Icon + bold headline on every status.
 
 
 async def target_from_args(

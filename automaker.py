@@ -99,35 +99,9 @@ JOIN_RETRIES = 4
 JOIN_RETRY_DELAY = 3
 
 
-# Premium custom emoji shown on .gen progress: an hourglass while working and
-# a check mark when done. The text after the emoji is bold.
-WORKING_EMOJI = ("\u23f3", 6113844439292054570)
-DONE_EMOJI = ("\u2705", 5411197345968701560)
-
-
-def _utf16(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
-
-
-async def set_fancy(event: Any, text: str, done: bool = False) -> None:
-    """Like set_status, but with a custom emoji in front and the text in bold."""
-    emoji, emoji_id = DONE_EMOJI if done else WORKING_EMOJI
-    full = f"{emoji} {text}"
-    entities = [
-        types.MessageEntityCustomEmoji(offset=0, length=_utf16(emoji), document_id=emoji_id),
-        types.MessageEntityBold(offset=_utf16(emoji) + 1, length=_utf16(text)),
-    ]
-    kwargs = {"link_preview": False, "formatting_entities": entities}
-    with contextlib.suppress(Exception):
-        if getattr(event, "out", True):
-            await event.edit(full, **kwargs)
-            return
-        reply = getattr(event, "status_reply", None)
-        if reply is None:
-            event.status_reply = await event.reply(full, **kwargs)
-            return
-        with contextlib.suppress(errors.MessageNotModifiedError):
-            await reply.edit(full, **kwargs)
+async def set_fancy(event: Any, text: str, done: bool = False, icon: str | None = None) -> None:
+    """Status with a tgmacicons icon: the stopwatch while working, a check when done."""
+    await set_status(event, text, icon or ("done" if done else "working"))
 CANCEL_WORDS = frozenset({".cancel", "cancel", ".stop", "stop", ".abort"})
 # Telegram answers a dead or revoked session with one of these, and no amount
 # of retrying brings it back; the worker has to be re-added with .login.
@@ -1055,6 +1029,7 @@ async def command_set(
         f"Demo channel set: {state.source_title}\n"
         f"{len(plan.posts)} post(s) will be copied by each .gen.\n"
         f"Workers ready: {free}",
+        "pin",
     )
 
 
@@ -1358,7 +1333,7 @@ async def command_accounts(
             f"{aside} set aside. .reset all retries them; .remove aside forgets them."
         )
     lines.append(f"Demo channel: {state.source_title or 'none yet, send .set in it'}")
-    await set_status(event, "\n".join(lines))
+    await set_status(event, "\n".join(lines), "users")
 
 
 async def command_reset(
@@ -1568,7 +1543,7 @@ async def command_remove(
     if unknown:
         lines.append("No worker matches: " + ", ".join(unknown[:12]))
         lines.append("Check .accounts for the names.")
-    await set_status(event, "\n".join(lines))
+    await set_status(event, "\n".join(lines), "remove")
 
 
 async def command_terminate(
@@ -1627,7 +1602,7 @@ async def command_terminate(
         lines += [f"  {name}: {reason}" for name, reason in failed[:12]]
     if not lines:
         lines.append("Nothing to do.")
-    await set_status(event, "\n".join(lines))
+    await set_status(event, "\n".join(lines), "logout")
 
 
 async def command_gen(
@@ -1791,7 +1766,7 @@ class StatusElsewhere:
 
     async def edit(self, text: str, **kwargs: Any) -> Any:
         """Edit the stand-in status message."""
-        return await self._status.edit(text, **{**PLAIN, **kwargs})
+        return await self._status.edit(text, **({**PLAIN, **kwargs} if not kwargs else kwargs))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._event, name)

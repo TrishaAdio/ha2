@@ -679,3 +679,13 @@ Re-running it is safe: every prompt offers the current value, so pressing Enter 
 # Security
 
 Never commit `.env` or Telethon `.session` files. Both are excluded by `.gitignore`, along with `.venv/`, `redirect_state.json` and `*.log`.
+
+## Status icons (`icons.py`)
+
+Every status message from every script starts with an icon from the
+[tgmacicons](https://t.me/addemoji/tgmacicons) custom emoji pack, followed by a
+bold first line. The icon is chosen from the message (stopwatch while working,
+check when done, cross on failure, and so on), or named explicitly with
+`set_status(event, text, "icon")`. The table of names and emoji IDs is in
+`icons.py`. Custom emoji only render when the account has Telegram Premium;
+otherwise the plain fallback emoji shows.

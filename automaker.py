@@ -1424,7 +1424,9 @@ async def worker_health(
         reason = str(exc)
         return ("dead" if "session" in reason else "unknown"), reason
     try:
-        full = await client(functions.users.GetFullUserRequest("me"))
+        full = await client(
+            functions.users.GetFullUserRequest(types.InputUserSelf())
+        )
         about = getattr(getattr(full, "full_user", None), "about", None) or ""
         await client(functions.account.UpdateProfileRequest(about=about))
         return "ok", "writes are allowed"

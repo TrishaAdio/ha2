@@ -1479,6 +1479,8 @@ async def remove_frozen(
         )
     else:
         lines.append(f"All {total} worker(s) answered; none is frozen or dead.")
+    if kept:
+        lines.append("Kept: " + ", ".join(kept[:12]))
     free, used, aside = state.counts
     lines += ["", f"Workers: {free} ready, {used} spent, {aside} aside"]
     await set_fancy(event, "\n".join(lines), done=True)

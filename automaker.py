@@ -8,6 +8,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .gen [count]              make that many copies of the demo channel
     .delete [link]            delete a copy and free its worker, never the demo
     .accounts                 list the workers and which ones are spent
+    .ids [all]                IDs of the copies that finished and are alive
     .reset [name|all]         mark workers unused again
     .remove <name|cuties>     forget workers; "cuties" drops frozen/spam ones
     .terminate [name|all]     log every other device out of the workers
@@ -1336,6 +1337,80 @@ async def command_accounts(
     await set_status(event, "\n".join(lines), "users")
 
 
+IDS_CHUNK = 3500  # Telegram caps a message at 4096 characters.
+
+
+async def command_ids(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """List the IDs of every copy that finished and is still alive.
+
+    A copy counts when every post went across (copied == total) and the
+    channel is still in this account's chat list, not deleted, banned or
+    restricted by Telegram. ".ids all" also lists the half-done and dead ones,
+    each with the reason, so nothing is hidden.
+    """
+    show_all = bool(args) and args[0].lower() == "all"
+    made = [(w, m) for w in state.workers for m in w.made if m.get("chat_id")]
+    if not made:
+        await set_status(event, "No copies yet. Make one with .gen.")
+        return
+
+    await set_status(event, f"Checking {len(made)} cop{'y' if len(made) == 1 else 'ies'}...")
+    # One pass over the chat list: a copy this account no longer sees in it
+    # was deleted, or this account was removed from it.
+    alive: dict[int, types.Channel] = {}
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+        if isinstance(entity, types.Channel):
+            alive[entity.id] = entity
+
+    good: list[str] = []
+    bad: list[str] = []
+    seen: set[int] = set()
+    for worker, item in made:
+        chat_id = int(item["chat_id"])
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        full_id = f"-100{chat_id}"
+        title = item.get("title") or "?"
+        copied, total = int(item.get("copied") or 0), int(item.get("total") or 0)
+        channel = alive.get(chat_id)
+        if channel is None:
+            why = "gone (deleted, or you were removed)"
+        elif getattr(channel, "restricted", False) or getattr(channel, "scam", False) or getattr(channel, "fake", False):
+            why = "restricted by Telegram"
+        elif total == 0 or copied < total:
+            why = f"incomplete ({copied}/{total} posts)"
+        else:
+            good.append(full_id)
+            continue
+        bad.append(f"{full_id}  {title}  [{worker.name}] - {why}")
+
+    lines = [f"Active copies: {len(good)} of {len(seen)}"]
+    lines += good or ["(none)"]
+    if show_all and bad:
+        lines += ["", f"Not counted ({len(bad)}):", *bad]
+    elif bad:
+        lines += ["", f"{len(bad)} more are incomplete or dead; .ids all lists them."]
+
+    text = "\n".join(lines)
+    chunks: list[str] = []
+    while len(text) > IDS_CHUNK:
+        cut = text.rfind("\n", 0, IDS_CHUNK)
+        cut = cut if cut > 0 else IDS_CHUNK
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    chunks.append(text)
+    await set_status(event, chunks[0], "copy" if good else "warn")
+    for extra in chunks[1:]:
+        with contextlib.suppress(Exception):
+            await client.send_message("me", extra, **PLAIN)
+    if len(chunks) > 1:
+        info(f".ids: the rest of the list ({len(chunks) - 1} more message(s)) is in Saved Messages.")
+
+
 async def command_reset(
     _client: TelegramClient, state: AutoState, event: Any, args: list[str]
 ) -> None:
@@ -1845,6 +1920,7 @@ COMMAND_HELP = (
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
+    ".ids [all]             IDs of finished, live copies (all = with dead)\n"
     ".reset [name|all]      free spent and set-aside workers\n"
     ".remove <name|aside|cuties|all>  forget workers (cuties = frozen/spam)\n"
     ".terminate <name|all>  log every other device out of the workers\n"
@@ -1862,6 +1938,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "gen": command_gen,
     "delete": command_delete,
     "accounts": command_accounts,
+    "ids": command_ids,
     "reset": command_reset,
     "remove": command_remove,
     "terminate": command_terminate,

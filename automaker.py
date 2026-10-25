@@ -9,7 +9,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .delete [link]            delete a copy and free its worker, never the demo
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
-    .remove <name|cuties>     forget workers; "cuties" drops the frozen ones
+    .remove <name|cuties>     forget workers; "cuties" drops frozen/spam ones
     .terminate [name|all]     log every other device out of the workers
     .cancel                   abort a login that is waiting for an answer
     .help                     show the list
@@ -1375,7 +1375,46 @@ async def command_reset(
 
 
 # Words that mean "remove the frozen accounts" to .remove.
-FROZEN_WORDS = {"cuties", "cutie", "frozen", "dead"}
+FROZEN_WORDS = {"cuties", "cutie", "frozen", "dead", "spam"}
+
+
+# What a set-aside reason says when the account is spam-limited. A fresh
+# invite link that reads as expired is a limited worker's channel being pulled.
+SPAM_SIGNS = (
+    "spam limit",
+    "restricts this account",
+    "rejected the fresh invite link",
+    "invitehashexpired",
+    "userrestricted",
+)
+SPAMBOT = "SpamBot"
+SPAMBOT_WAIT = 20.0
+
+
+async def ask_spambot(client: TelegramClient) -> tuple[str, str]:
+    """Ask @SpamBot whether this account is limited, then clear the chat.
+
+    Only the bot's English replies are read. Anything it says that is not
+    clearly "no limits" or clearly "limited" comes back as unknown, which
+    keeps the worker: a wrong guess must never remove a good account.
+    """
+    try:
+        async with client.conversation(SPAMBOT, timeout=SPAMBOT_WAIT) as convo:
+            await convo.send_message("/start")
+            reply = await convo.get_response()
+        text = (reply.raw_text or "").lower()
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"@SpamBot did not answer ({short_error(exc)})"
+    finally:
+        with contextlib.suppress(Exception):
+            await client.delete_dialog(SPAMBOT)
+    if "frozen" in text or "blocked" in text:
+        return "frozen", "@SpamBot says the account is frozen"
+    if "no limits" in text or "good news" in text or "free as a bird" in text:
+        return "ok", "@SpamBot: no limits"
+    if "limited" in text or "restrict" in text or "annoying" in text:
+        return "spam", "@SpamBot says the account is spam-limited"
+    return "unknown", "@SpamBot gave an answer this did not recognise"
 
 
 async def worker_health(
@@ -1383,7 +1422,12 @@ async def worker_health(
 ) -> tuple[str, str]:
     """Say whether a worker is frozen, dead or still fine.
 
-    Returns one of "frozen", "dead", "ok" or "unknown", with a reason.
+    Returns one of "frozen", "spam", "dead", "ok" or "unknown", with a reason.
+
+    A worker .gen already set aside for a spam limit, or for a fresh invite
+    link Telegram rejected (what a limited account's new channel does), counts
+    as spam without connecting. Every other worker that passes the write test
+    is then asked about by @SpamBot.
 
     A frozen account answers normally to reads, which is why it is only caught
     halfway through a .gen, sometimes as a flood wait that is not a real rate
@@ -1391,8 +1435,11 @@ async def worker_health(
     written back unchanged: nothing on the profile moves, and a frozen account
     raises FROZEN_METHOD_INVALID instead.
     """
-    if "frozen" in worker.disabled.lower():
+    recorded = worker.disabled.lower()
+    if "frozen" in recorded:
         return "frozen", worker.disabled
+    if any(sign in recorded for sign in SPAM_SIGNS):
+        return "spam", worker.disabled
     try:
         client = await worker_client(worker, api_id, api_hash)
     except WorkerUnusable as exc:
@@ -1404,7 +1451,7 @@ async def worker_health(
         )
         about = getattr(getattr(full, "full_user", None), "about", None) or ""
         await client(functions.account.UpdateProfileRequest(about=about))
-        return "ok", "writes are allowed"
+        return await ask_spambot(client)
     except errors.FrozenMethodInvalidError:
         return "frozen", "the account is frozen by Telegram"
     except errors.UserDeactivatedBanError:
@@ -1423,7 +1470,7 @@ async def remove_frozen(
     api_id: int,
     api_hash: str,
 ) -> None:
-    """Check every worker and forget the ones Telegram has frozen or killed."""
+    """Check every worker and forget the frozen, spam-limited and dead ones."""
     if not state.workers:
         await set_status(event, "There are no workers yet. Add one with .login.")
         return
@@ -1433,7 +1480,7 @@ async def remove_frozen(
     for number, worker in enumerate(list(state.workers), start=1):
         await set_fancy(event, f"Checking {worker.name}... {number}/{total}")
         verdict, reason = await worker_health(worker, api_id, api_hash)
-        if verdict in {"frozen", "dead"}:
+        if verdict in {"frozen", "spam", "dead"}:
             doomed.append((worker, f"{verdict}: {reason}"))
         else:
             kept.append(f"{worker.name} ({reason})" if verdict == "unknown" else worker.name)
@@ -1442,7 +1489,7 @@ async def remove_frozen(
         state.workers.remove(worker)
     if doomed:
         state.save()
-        success(f"Removed {len(doomed)} frozen or dead worker(s).")
+        success(f"Removed {len(doomed)} frozen, spam-limited or dead worker(s).")
 
     lines: list[str] = []
     if doomed:
@@ -1453,7 +1500,7 @@ async def remove_frozen(
             "Telegram itself to be sure."
         )
     else:
-        lines.append(f"All {total} worker(s) answered; none is frozen or dead.")
+        lines.append(f"All {total} worker(s) answered; none is frozen, spam-limited or dead.")
     if kept:
         lines.append("Kept: " + ", ".join(kept[:12]))
     free, used, aside = state.counts
@@ -1481,7 +1528,7 @@ async def command_remove(
             event,
             "Usage: .remove <name>     (w3, or the account's name)\n"
             "       .remove aside      every worker Telegram refused\n"
-            "       .remove cuties     check them all, drop the frozen ones\n"
+            "       .remove cuties     drop frozen + spam-limited workers\n"
             "       .remove all        every worker",
         )
         return
@@ -1799,7 +1846,7 @@ COMMAND_HELP = (
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".reset [name|all]      free spent and set-aside workers\n"
-    ".remove <name|aside|cuties|all>  forget workers (cuties = frozen)\n"
+    ".remove <name|aside|cuties|all>  forget workers (cuties = frozen/spam)\n"
     ".terminate <name|all>  log every other device out of the workers\n"
     ".cancel                stop a login that is waiting\n"
     + GATE_HELP + "\n"

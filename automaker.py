@@ -9,7 +9,7 @@ This is main.py's mode 3. The signed-in (premium) account is the operator.
     .delete [link]            delete a copy and free its worker, never the demo
     .accounts                 list the workers and which ones are spent
     .reset [name|all]         mark workers unused again
-    .remove <name>            forget a worker and its session
+    .remove <name|cuties>     forget workers; "cuties" drops the frozen ones
     .terminate [name|all]     log every other device out of the workers
     .cancel                   abort a login that is waiting for an answer
     .help                     show the list
@@ -1399,8 +1399,96 @@ async def command_reset(
     await set_status(event, f"{worker.name} ({worker.label}) is ready again.")
 
 
+# Words that mean "remove the frozen accounts" to .remove.
+FROZEN_WORDS = {"cuties", "cutie", "frozen", "dead"}
+
+
+async def worker_health(
+    worker: Worker, api_id: int, api_hash: str
+) -> tuple[str, str]:
+    """Say whether a worker is frozen, dead or still fine.
+
+    Returns one of "frozen", "dead", "ok" or "unknown", with a reason.
+
+    A frozen account answers normally to reads, which is why it is only caught
+    halfway through a .gen, sometimes as a flood wait that is not a real rate
+    limit. Telegram refuses writes on it, so the account's own "about" text is
+    written back unchanged: nothing on the profile moves, and a frozen account
+    raises FROZEN_METHOD_INVALID instead.
+    """
+    if "frozen" in worker.disabled.lower():
+        return "frozen", worker.disabled
+    try:
+        client = await worker_client(worker, api_id, api_hash)
+    except WorkerUnusable as exc:
+        reason = str(exc)
+        return ("dead" if "session" in reason else "unknown"), reason
+    try:
+        full = await client(functions.users.GetFullUserRequest("me"))
+        about = getattr(getattr(full, "full_user", None), "about", None) or ""
+        await client(functions.account.UpdateProfileRequest(about=about))
+        return "ok", "writes are allowed"
+    except errors.FrozenMethodInvalidError:
+        return "frozen", "the account is frozen by Telegram"
+    except errors.UserDeactivatedBanError:
+        return "dead", "the account is banned by Telegram"
+    except DEAD_SESSION_ERRORS as exc:
+        return "dead", f"its session is dead ({type(exc).__name__})"
+    except Exception as exc:  # noqa: BLE001  Not proof of anything; keep it.
+        return "unknown", why_unusable(exc)
+    finally:
+        await client.disconnect()
+
+
+async def remove_frozen(
+    state: AutoState,
+    event: Any,
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Check every worker and forget the ones Telegram has frozen or killed."""
+    if not state.workers:
+        await set_status(event, "There are no workers yet. Add one with .login.")
+        return
+    doomed: list[tuple[Worker, str]] = []
+    kept: list[str] = []
+    total = len(state.workers)
+    for number, worker in enumerate(list(state.workers), start=1):
+        await set_fancy(event, f"Checking {worker.name}... {number}/{total}")
+        verdict, reason = await worker_health(worker, api_id, api_hash)
+        if verdict in {"frozen", "dead"}:
+            doomed.append((worker, f"{verdict}: {reason}"))
+        else:
+            kept.append(f"{worker.name} ({reason})" if verdict == "unknown" else worker.name)
+
+    for worker, _reason in doomed:
+        state.workers.remove(worker)
+    if doomed:
+        state.save()
+        success(f"Removed {len(doomed)} frozen or dead worker(s).")
+
+    lines: list[str] = []
+    if doomed:
+        lines.append(f"Removed {len(doomed)} of {total}:")
+        lines += [f"  {worker.name} ({worker.label}) - {reason}" for worker, reason in doomed]
+        lines.append(
+            "Their sessions are gone from the state file; log them out of "
+            "Telegram itself to be sure."
+        )
+    else:
+        lines.append(f"All {total} worker(s) answered; none is frozen or dead.")
+    free, used, aside = state.counts
+    lines += ["", f"Workers: {free} ready, {used} spent, {aside} aside"]
+    await set_fancy(event, "\n".join(lines), done=True)
+
+
 async def command_remove(
-    _client: TelegramClient, state: AutoState, event: Any, args: list[str]
+    _client: TelegramClient,
+    state: AutoState,
+    event: Any,
+    args: list[str],
+    api_id: int,
+    api_hash: str,
 ) -> None:
     """Forget workers, dropping their stored sessions.
 
@@ -1414,8 +1502,13 @@ async def command_remove(
             event,
             "Usage: .remove <name>     (w3, or the account's name)\n"
             "       .remove aside      every worker Telegram refused\n"
+            "       .remove cuties     check them all, drop the frozen ones\n"
             "       .remove all        every worker",
         )
+        return
+
+    if raw.lower() in FROZEN_WORDS:
+        await remove_frozen(state, event, api_id, api_hash)
         return
 
     if raw.lower() in {"all", "aside", "disabled"}:
@@ -1727,7 +1820,7 @@ COMMAND_HELP = (
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".reset [name|all]      free spent and set-aside workers\n"
-    ".remove <name|aside|all>  forget workers and their sessions\n"
+    ".remove <name|aside|cuties|all>  forget workers (cuties = frozen)\n"
     ".terminate <name|all>  log every other device out of the workers\n"
     ".cancel                stop a login that is waiting\n"
     + GATE_HELP + "\n"
@@ -1735,7 +1828,7 @@ COMMAND_HELP = (
 )
 
 # Commands that need the API credentials to sign in to a worker account.
-WITH_CREDENTIALS = {"login", "session", "gen", "terminate", "delete"}
+WITH_CREDENTIALS = {"login", "session", "gen", "terminate", "delete", "remove"}
 COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "set": command_set,
     "login": command_login,

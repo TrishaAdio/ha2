@@ -695,8 +695,9 @@ otherwise the plain fallback emoji shows.
 Runs inside `main.py`'s command mode and auto maker. Every message one of your
 Telegram Business quick replies sends (`/category`, `/foreign`, long texts with
 links, zips, photos, albums) is deleted for both sides 60 to 120 minutes later.
-A typed trigger such as `/add` is deleted too, along with everything you send in
-that chat for the next 3 minutes (`AUTODELETE_WINDOW`, seconds). Pending
+A typed trigger such as `/add` is deleted 30 minutes later (`.autodel addtime`),
+along with everything you send in that chat for the next 3 minutes
+(`AUTODELETE_WINDOW`, seconds). Pending
 deletions live in `autodelete_state.json` and survive a restart.
 
 `.autodel` shows the status; `.autodel on|off`, `.autodel words category foreign add`

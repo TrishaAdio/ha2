@@ -16,7 +16,8 @@ coming from a quick reply once it is in a chat:
   one of its items matches.
 * It follows a trigger. Sending "/add" (or any other watched word) as a
   message is itself deleted, and so is everything you send in that chat for
-  the next WINDOW seconds.
+  the next WINDOW seconds. These go after add_minutes (30 by default), not
+  after the 1-2 hours quick replies wait.
 
 Pending deletions are saved to a file, so a restart loses none of them: one
 that fell due while the script was down is deleted as soon as it is back.
@@ -27,7 +28,8 @@ retried a few times, then dropped.
     .autodel on | off           start or stop scheduling new deletions
     .autodel words <w> [w...]   the watched quick replies / trigger words
                                 ("all" = every quick reply you have)
-    .autodel time <min> <max>   the delay range in minutes (default 60 120)
+    .autodel time <min> <max>   quick-reply delay range in minutes (default 60 120)
+    .autodel addtime <min>      delay for /add and what follows it (default 30)
     .autodel now                delete everything pending right away
     .autodel clear              forget everything pending, delete nothing
 """
@@ -111,6 +113,7 @@ class Settings:
     words: list[str] = field(default_factory=lambda: list(DEFAULT_WORDS))
     min_minutes: float = 60
     max_minutes: float = 120
+    add_minutes: float = 30  # /add and what follows it go after exactly this long.
 
 
 def normalize(text: str) -> str:
@@ -166,6 +169,7 @@ class AutoDelete:
             words=[str(w).lower() for w in stored.get("words") or DEFAULT_WORDS],
             min_minutes=float(stored.get("min_minutes") or 60),
             max_minutes=float(stored.get("max_minutes") or 120),
+            add_minutes=float(stored.get("add_minutes") or 30),
         )
         for item in raw.get("pending") or []:
             with contextlib.suppress(Exception):
@@ -238,8 +242,9 @@ class AutoDelete:
         high = max(low, self.settings.max_minutes)
         return random.uniform(low, high) * 60
 
-    def schedule(self, peer: Peer, message_id: int) -> None:
-        self.pending.append(Pending(peer, [message_id], time.time() + self.delay()))
+    def schedule(self, peer: Peer, message_id: int, seconds: float | None = None) -> None:
+        wait = self.delay() if seconds is None else seconds
+        self.pending.append(Pending(peer, [message_id], time.time() + wait))
         self.save()
         self.wake.set()
 
@@ -267,7 +272,10 @@ class AutoDelete:
             peer = Peer.of(await event.get_input_chat(), event.chat_id)
             if getattr(message, "grouped_id", None):
                 self.albums.add(message.grouped_id)
-            self.schedule(peer, message.id)
+            # /add and what follows it go after add_minutes; quick replies after
+            # a random 1-2 hours.
+            after_add = reason != "quick reply"
+            self.schedule(peer, message.id, self.settings.add_minutes * 60 if after_add else None)
             info(f"Auto delete: message {message.id} in {peer.key} queued ({reason}).")
         except Exception as exc:  # noqa: BLE001  Must never break the listener.
             failure(f"Auto delete: could not queue a message: {exc}")
@@ -393,7 +401,8 @@ class AutoDelete:
         s = self.settings
         lines = [
             f"Auto delete is {'on' if s.enabled else 'off'}",
-            f"Delay: {s.min_minutes:g}-{s.max_minutes:g} minutes after sending",
+            f"Quick replies go after {s.min_minutes:g}-{s.max_minutes:g} minutes",
+            f"/add and what follows it go after {s.add_minutes:g} minutes",
             f"Watching: {', '.join('/' + w if w != 'all' else 'every quick reply' for w in s.words)}",
         ]
         if self.shortcuts:
@@ -445,6 +454,18 @@ class AutoDelete:
             self.save()
             await set_status(event, f"New quick replies go after {low:g}-{high:g} minutes.", "settings")
             return
+        if verb == "addtime":
+            try:
+                minutes = float(rest[0])
+                if minutes < 1:
+                    raise ValueError
+            except (IndexError, ValueError):
+                await set_status(event, "Usage: .autodel addtime 30   (minutes, at least 1)", "help")
+                return
+            self.settings.add_minutes = minutes
+            self.save()
+            await set_status(event, f"/add and what follows it now go after {minutes:g} minutes.", "settings")
+            return
         if verb == "now":
             await set_status(event, "Deleting everything pending...")
             count = await self.delete_due(force=True)
@@ -458,7 +479,7 @@ class AutoDelete:
             self.save()
             await set_status(event, f"Removed {count} message(s) from the queue; nothing was deleted.", "remove")
             return
-        await set_status(event, "Usage: .autodel [on|off|words ...|time <min> <max>|now|clear]", "help")
+        await set_status(event, "Usage: .autodel [on|off|words ...|time <min> <max>|addtime <min>|now|clear]", "help")
 
 
 QUICK_REPLY_UPDATES = (

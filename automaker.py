@@ -267,48 +267,16 @@ def supported_rights(**wanted: bool) -> types.ChatAdminRights:
     )
 
 
-def operator_rights(megagroup: bool) -> types.ChatAdminRights:
-    """Return the rights the operator account is promoted with.
-
-    Channels and groups take different sets, the way the official apps offer
-    them: posting and editing exist only in broadcast channels, banning and
-    pinning only in groups, and Telegram can refuse a promotion that mixes the
-    two. The copy needs change_info for the photo, description and content
-    protection, post and edit rights for the posts and their links, and delete
-    rights to remove service messages. add_admins is never given, so the
-    operator cannot promote anyone else.
-    """
-    if megagroup:
-        return supported_rights(
-            change_info=True,
-            delete_messages=True,
-            ban_users=True,
-            invite_users=True,
-            pin_messages=True,
-            manage_call=True,
-            other=True,
-        )
-    return supported_rights(
-        change_info=True,
-        post_messages=True,
-        edit_messages=True,
-        delete_messages=True,
-        invite_users=True,
-        manage_call=True,
-        post_stories=True,
-        edit_stories=True,
-        delete_stories=True,
-        other=True,
-    )
-
-
 def full_rights(megagroup: bool) -> types.ChatAdminRights:
-    """Return every admin right the owner can hand out, for the admin bot.
+    """Return every admin right the owner can hand out.
 
-    Like operator_rights, channels and groups get their own set, since Telegram
-    can refuse a promotion that mixes the two. Unlike the operator, the bot is
-    given add_admins too: it gets full rights. anonymous is left off, so the
-    bot's actions stay visible as its own.
+    Both the operator (your premium account) and the admin bot get this set,
+    add_admins included, so either can manage the channel and promote others
+    without the worker. Channels and groups get their own set, the way the
+    official apps offer them: posting and editing exist only in broadcast
+    channels, banning and pinning only in groups, and Telegram can refuse a
+    promotion that mixes the two. anonymous is left off, so actions stay
+    visible as their own.
     """
     if megagroup:
         return supported_rights(
@@ -778,7 +746,7 @@ async def operator_joins(
 async def promote_operator(
     worker: TelegramClient, channel: types.Channel, operator_id: int
 ) -> None:
-    """Make the operator an admin with every right the copy needs.
+    """Make the operator an admin with full rights, add_admins included.
 
     The worker has to learn the operator's access hash before it can name it in
     a request, and reading the member list is what teaches it: the operator has
@@ -824,7 +792,7 @@ async def promote_operator(
                 user_id=types.InputUser(
                     user_id=found.id, access_hash=found.access_hash or 0
                 ),
-                admin_rights=operator_rights(bool(channel.megagroup)),
+                admin_rights=full_rights(bool(channel.megagroup)),
                 rank="admin" if channel.megagroup else "",
             ),
             label="promote your account",
@@ -844,8 +812,8 @@ async def promote_operator(
 async def add_admin_bot(worker: TelegramClient, channel: types.Channel) -> str:
     """Add ADMIN_BOT to the new channel as an admin with full rights.
 
-    The worker does this because it owns the channel: only the owner can grant
-    add_admins, which the operator deliberately does not have. Promoting a bot
+    The worker does this because it owns the channel and the bot is added
+    alongside the operator, both with full rights. Promoting a bot
     that is not a member adds it at the same time, so no separate invite is
     needed.
 

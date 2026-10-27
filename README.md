@@ -268,7 +268,7 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 
 1. Picks a **random worker that has not been used yet**.
 2. The worker creates an empty channel with the **same name and the same kind** (channel or group) as the demo channel.
-3. Your account joins it by invite link and the worker promotes it to admin. The worker also adds **@DemoSaviourBot** as an admin with full rights (set `AUTOMAKER_ADMIN_BOT` in `.env` to use another bot; left empty, it uses @DemoSaviourBot). If the bot can't be added, the copy still goes ahead and the report says why. The worker's job ends here.
+3. Your account joins it by invite link and the worker promotes it to admin with **full rights**, including adding admins, so your premium account can fully manage the copy and promote anyone else without the worker. The worker also adds **@DemoSaviourBot** as an admin with full rights (set `AUTOMAKER_ADMIN_BOT` in `.env` to use another bot; left empty, it uses @DemoSaviourBot). If the bot can't be added, the copy still goes ahead and the report says why. The worker's job ends here.
 4. **Your account** then copies the demo channel into it, exactly as `.clone` does:
    - profile photo and description
    - every post one by one in order, with its markdown, links, premium emoji, albums and spoilers
@@ -305,7 +305,7 @@ The workers, their sessions and the demo channel live in `automaker_state.json` 
 
 - Telegram caps how many channels an account may create per day, and new accounts are limited hardest. That is what the pool is for.
 - Your account joins every copy, and Telegram caps how many channels one account can be in (500, or 1000 with Premium). `.gen` reports it plainly when you reach that.
-- The worker stays the owner of each copy; your account is an admin. Transferring ownership needs 2FA on the worker and a session several days old, so it is not done.
+- The worker stays the owner of each copy; your account is an admin with full rights (everything except ownership itself). Transferring ownership needs 2FA on the worker and a session several days old, so it is not done.
 
 
 # oho.py: Multi-Account Group Cloner

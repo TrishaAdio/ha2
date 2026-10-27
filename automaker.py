@@ -53,6 +53,7 @@ from telethon import TelegramClient, errors, events, functions, types, utils
 from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
+from autodelete import command_autodel, start_autodelete
 from main import (
     COMMAND_PATTERN,
     GATE_HELP,
@@ -1912,6 +1913,13 @@ async def keep_out_of_source(client: TelegramClient, state: AutoState, event: An
     return StatusElsewhere(event, status_message)
 
 
+async def command_autodel_auto(
+    client: TelegramClient, _state: AutoState, event: Any, args: list[str]
+) -> None:
+    """.autodel inside the auto maker; see autodelete.py."""
+    await command_autodel(client, event, args)
+
+
 COMMAND_HELP = (
     "Auto maker\n"
     ".set [link]            choose the demo channel (send it in the channel)\n"
@@ -1921,6 +1929,7 @@ COMMAND_HELP = (
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".ids [all]             IDs of finished, live copies (all = with dead)\n"
+    ".autodel [on|off|...]  delete quick replies 1-2 h after sending\n"
     ".reset [name|all]      free spent and set-aside workers\n"
     ".remove <name|aside|cuties|all>  forget workers (cuties = frozen/spam)\n"
     ".terminate <name|all>  log every other device out of the workers\n"
@@ -1939,6 +1948,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "delete": command_delete,
     "accounts": command_accounts,
     "ids": command_ids,
+    "autodel": command_autodel_auto,
     "reset": command_reset,
     "remove": command_remove,
     "terminate": command_terminate,
@@ -2008,5 +2018,6 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
     if not state.workers:
         warning("No workers yet. Send .login to add one.")
     report_gate(gate)
+    start_autodelete(client)
     info("Send the commands from this account, or an admin's, in any chat. Ctrl+C to stop.")
     await client.run_until_disconnected()

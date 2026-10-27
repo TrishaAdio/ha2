@@ -2916,6 +2916,9 @@ def report_gate(gate: CommandGate) -> None:
 
 async def run_commands(client: TelegramClient) -> None:
     """Listen for the dot commands until interrupted."""
+    from autodelete import AUTODEL_HELP, command_autodel, start_autodelete
+
+    COMMANDS.setdefault("autodel", command_autodel)
     busy = asyncio.Lock()
     gate = CommandGate()
     await gate.load(client)
@@ -2925,7 +2928,7 @@ async def run_commands(client: TelegramClient) -> None:
         name = (event.pattern_match.group(1) or "").lower()
         raw_args = (event.pattern_match.group(2) or "").strip()
         if name == "help":
-            await set_status(event, COMMAND_HELP)
+            await set_status(event, COMMAND_HELP + "\n" + AUTODEL_HELP)
             return
         try:
             if await gate.handle(client, event, name, raw_args.split()):
@@ -2948,8 +2951,9 @@ async def run_commands(client: TelegramClient) -> None:
                 await set_status(event, f".{name} failed: {exc}")
 
     print(Fore.YELLOW + Style.BRIGHT + "\n== COMMAND MODE ==")
-    print(Fore.WHITE + COMMAND_HELP)
+    print(Fore.WHITE + COMMAND_HELP + "\n" + AUTODEL_HELP)
     report_gate(gate)
+    start_autodelete(client)
     info("Send the commands from this account, or an admin's, in any chat. Ctrl+C to stop.")
     await client.run_until_disconnected()
 

@@ -689,3 +689,15 @@ check when done, cross on failure, and so on), or named explicitly with
 `set_status(event, text, "icon")`. The table of names and emoji IDs is in
 `icons.py`. Custom emoji only render when the account has Telegram Premium;
 otherwise the plain fallback emoji shows.
+
+## Auto delete for quick replies (`autodelete.py`)
+
+Runs inside `main.py`'s command mode and auto maker. Every message one of your
+Telegram Business quick replies sends (`/category`, `/foreign`, long texts with
+links, zips, photos, albums) is deleted for both sides 60 to 120 minutes later.
+A typed trigger such as `/add` is deleted too, along with everything you send in
+that chat for the next 3 minutes (`AUTODELETE_WINDOW`, seconds). Pending
+deletions live in `autodelete_state.json` and survive a restart.
+
+`.autodel` shows the status; `.autodel on|off`, `.autodel words category foreign add`
+(or `all`), `.autodel time 60 120`, `.autodel now` and `.autodel clear` change it.

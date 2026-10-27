@@ -17,3 +17,5 @@ automaker_state.json
 # main.py: the accounts allowed to send commands (.allow / .deny).
 command_admins.json
 command_admins.json.tmp
+autodelete_state.json
+autodelete_state.broken.json

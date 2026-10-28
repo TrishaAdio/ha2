@@ -1518,13 +1518,181 @@ GATE_HELP = (
 )
 
 
+# {Click Here}[https://t.me/m/abc], or the usual Markdown [Click Here](url).
+LINK_TARGET_RE = re.compile(
+    r"^\s*(?:\{(?P<curly>[^{}]+)\}\s*\[(?P<curly_url>[^\[\]\s]+)\]"
+    r"|\[(?P<md>[^\[\]]+)\]\s*\((?P<md_url>[^()\s]+)\))\s*$"
+)
+
+
+def parse_link_target(raw: str) -> tuple[str, str] | None:
+    """Return (text, url) from {Text}[url] or [Text](url), or None."""
+    match = LINK_TARGET_RE.match(raw)
+    if not match:
+        return None
+    text = (match.group("curly") or match.group("md") or "").strip()
+    url = (match.group("curly_url") or match.group("md_url") or "").strip()
+    if not text or not url:
+        return None
+    if not re.match(r"^(?:https?|tg)://", url, re.IGNORECASE):
+        url = "https://" + url  # t.me/m/abc works without a scheme too.
+    return text, url
+
+
+def find_link_rewrites(text: str, old: str, label: str) -> list[Rewrite]:
+    """Locate every @old and bare t.me/old, the whole token, to become label."""
+    rewrites = [
+        Rewrite(match.start(), match.end(), label)
+        for regex in (MENTION_RE, TME_RE)
+        for match in regex.finditer(text)
+        if match.group(1).lower() == old.lower()
+    ]
+    rewrites.sort(key=lambda item: item.start)
+    deduped: list[Rewrite] = []
+    for rewrite in rewrites:
+        if deduped and rewrite.start < deduped[-1].end:
+            continue
+        deduped.append(rewrite)
+    return deduped
+
+
+def rewrite_message_link(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    old: str,
+    label: str,
+    url: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Turn every @old into a bold label hyperlinked to url.
+
+    Hyperlinks elsewhere in the post that point at t.me/old are repointed at
+    url too. Any old hyperlink overlapping a new label is dropped, since one
+    piece of text can only link to one place.
+    """
+
+    def relink(target: str) -> str:
+        match = TME_RE.fullmatch(target.strip())
+        return url if match and match.group(1).lower() == old.lower() else target
+
+    rewrites = find_link_rewrites(text, old, label)
+    result = apply_text_rewrites(text, entities, rewrites, relink)
+    if result is None or not rewrites:
+        return result
+    new_text, moved = result
+
+    # Where each label sits in the new text, in UTF-16 units.
+    spans: list[tuple[int, int]] = []
+    shift = 0
+    label_units = utf16_length(label)
+    for rewrite in rewrites:
+        start = utf16_offset(text, rewrite.start) + shift
+        spans.append((start, start + label_units))
+        shift += label_units - (
+            utf16_offset(text, rewrite.end) - utf16_offset(text, rewrite.start)
+        )
+
+    def overlaps(entity: types.TypeMessageEntity) -> bool:
+        end = entity.offset + entity.length
+        return any(entity.offset < s_end and s_start < end for s_start, s_end in spans)
+
+    kept = [
+        entity
+        for entity in moved
+        if not (isinstance(entity, types.MessageEntityTextUrl) and overlaps(entity))
+    ]
+    for start, end in spans:
+        kept.append(types.MessageEntityBold(offset=start, length=end - start))
+        kept.append(types.MessageEntityTextUrl(offset=start, length=end - start, url=url))
+    kept.sort(key=lambda entity: (entity.offset, -entity.length))
+    return new_text, kept
+
+
+async def command_change_link(
+    client: TelegramClient, event: object, old: str, label: str, url: str
+) -> None:
+    """Replace @old in every post with a bold label linking to url."""
+    scope = f"@{old}"
+    info(f"Rewriting {scope} to bold link {label!r} -> {url} in chat {event.chat_id}...")
+    await set_status(event, f"Rewriting {scope} to {label} ({url})...")
+
+    stats = ChangeStats()
+    async for message in client.iter_messages(event.chat_id):
+        if message.action is not None or message.id == event.id:
+            continue
+        if not message.message:
+            continue
+
+        result = rewrite_message_link(message.message, message.entities, old, label, url)
+        if result is None:
+            stats.unchanged += 1
+            continue
+
+        new_text, new_entities = result
+        try:
+            await retry_on_wait(
+                client.edit_message,
+                event.chat_id,
+                message.id,
+                new_text,
+                formatting_entities=new_entities,
+                link_preview=bool(message.web_preview),
+            )
+            stats.edited += 1
+        except errors.MessageNotModifiedError:
+            stats.unchanged += 1
+        except (
+            errors.MessageAuthorRequiredError,
+            errors.MessageEditTimeExpiredError,
+            errors.ChatAdminRequiredError,
+        ):
+            stats.locked += 1
+        except Exception as exc:  # noqa: BLE001
+            stats.failed += 1
+            failure(f"Message {message.id} could not be edited: {exc}")
+
+        if stats.edited and stats.edited % STATUS_EVERY == 0:
+            await set_status(event, f"Rewriting {scope} to {label}... {stats.edited} edited")
+        await asyncio.sleep(EDIT_DELAY)
+
+    summary = f"Rewrote {scope} to {label} ({url}): {stats.edited} edited"
+    if stats.unchanged:
+        summary += f", {stats.unchanged} already fine"
+    if stats.locked:
+        summary += f", {stats.locked} not editable"
+    if stats.failed:
+        summary += f", {stats.failed} failed"
+    success(summary)
+    await set_status(event, summary)
+
+
+CHANGE_USAGE = (
+    "Usage: .change @newname   or   .change @oldname @newname   or   "
+    ".change @oldname {Click Here}[https://t.me/m/abc]"
+)
+
+
 async def command_change(client: TelegramClient, event: object, args: list[str]) -> None:
     """Rewrite usernames across every post in the current chat."""
+    # .change @old {Text}[url]: the link part may contain spaces, so it is read
+    # from the raw command text rather than the whitespace-split args.
+    match = getattr(event, "pattern_match", None)
+    raw = ((match.group(2) if match else None) or " ".join(args)).strip()
+    first, _, rest = raw.partition(" ")
+    rest = re.sub(r"^to\s+", "", rest.strip(), flags=re.IGNORECASE)
+    if rest[:1] in {"{", "["}:
+        old = clean_username(first)
+        target = parse_link_target(rest)
+        if not old:
+            await set_status(event, f"{first} is not a valid username.")
+            return
+        if target is None:
+            await set_status(event, CHANGE_USAGE)
+            return
+        await command_change_link(client, event, old, *target)
+        return
+
     if not args or len(args) > 2:
-        await set_status(
-            event,
-            "Usage: .change @newname   or   .change @oldname @newname",
-        )
+        await set_status(event, CHANGE_USAGE)
         return
 
     if len(args) == 2:
@@ -2898,6 +3066,7 @@ COMMAND_HELP = (
     "Commands\n"
     ".change @newname          replace every username in every post\n"
     ".change @oldname @newname replace only that username\n"
+    ".change @oldname {Text}[url]  turn it into a bold link\n"
     ".clone [title]            clone this chat, post by post, in order\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"
     + GATE_HELP + "\n"

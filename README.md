@@ -84,6 +84,7 @@ In command mode the script listens for dot commands typed **from your own accoun
 ```text
 .change @newname            replace every username in every post
 .change @oldname @newname   replace only that username
+.change @oldname {Text}[url]  turn that username into a bold link
 .clone [title]              clone this chat into a private channel
 .help                       show the list
 ```
@@ -91,6 +92,14 @@ In command mode the script listens for dot commands typed **from your own accoun
 ## `.change`
 
 Run it in a channel to rewrite usernames across the whole history. With one argument every `@mention` becomes the new name; with two, only the named username is touched, which is the safer form.
+
+### Turning a username into a bold link
+
+```text
+.change @UserHehe {Click Here}[https://t.me/m/PQ6OnChUM]
+```
+
+Every `@UserHehe`, and every bare `t.me/UserHehe` link, is replaced with **Click Here** in bold, linked to the URL you give. Hyperlinks elsewhere in the post that point at `t.me/UserHehe` are repointed to that URL as well. The rest of the post keeps its formatting. Standard Markdown `[Click Here](url)` works too, and so does an optional `to` (`.change @UserHehe to {Click Here}[url]`). A URL without a scheme gets `https://` added.
 
 What it rewrites:
 

@@ -1539,42 +1539,134 @@ def parse_link_target(raw: str) -> tuple[str, str] | None:
     return text, url
 
 
-def find_link_rewrites(text: str, old: str, label: str) -> list[Rewrite]:
-    """Locate every @old and bare t.me/old, the whole token, to become label."""
-    rewrites = [
-        Rewrite(match.start(), match.end(), label)
-        for regex in (MENTION_RE, TME_RE)
-        for match in regex.finditer(text)
-        if match.group(1).lower() == old.lower()
-    ]
-    rewrites.sort(key=lambda item: item.start)
+def _dedupe_rewrites(rewrites: list[Rewrite]) -> list[Rewrite]:
+    """Sort rewrites and drop any that overlap an earlier one."""
+    rewrites.sort(key=lambda item: (item.start, -(item.end - item.start)))
     deduped: list[Rewrite] = []
     for rewrite in rewrites:
         if deduped and rewrite.start < deduped[-1].end:
-            continue
+            continue  # Overlapping matches would corrupt the offsets.
         deduped.append(rewrite)
     return deduped
 
 
-def rewrite_message_link(
+def find_link_rewrites(text: str, old: str, label: str) -> list[Rewrite]:
+    """Locate every @old and bare t.me/old, the whole token, to become label."""
+    return _dedupe_rewrites(
+        [
+            Rewrite(match.start(), match.end(), label)
+            for regex in (MENTION_RE, TME_RE)
+            for match in regex.finditer(text)
+            if match.group(1).lower() == old.lower()
+        ]
+    )
+
+
+def phrase_regex(phrase: str) -> re.Pattern[str]:
+    """Match a phrase as whole words, case-insensitively, any spacing.
+
+    "Pure Pleasure" matches "pure  pleasure" and "Pure\\nPleasure", but not
+    "PurePleasures" or the name inside "@PurePleasure".
+    """
+    body = r"\s+".join(re.escape(part) for part in phrase.split())
+    prefix = r"(?<![\w@/])" if re.match(r"\w", phrase) else ""
+    suffix = r"(?!\w)" if re.search(r"\w$", phrase) else ""
+    return re.compile(prefix + body + suffix, re.IGNORECASE)
+
+
+def find_phrase_rewrites(text: str, phrase: str, label: str) -> list[Rewrite]:
+    """Locate every occurrence of a plain phrase, to become label."""
+    return _dedupe_rewrites(
+        [
+            Rewrite(match.start(), match.end(), label)
+            for match in phrase_regex(phrase).finditer(text)
+        ]
+    )
+
+
+def url_key(url: str) -> str:
+    """Normalise a URL for comparison: no scheme, www or trailing slash.
+
+    Only the host is lower-cased; paths such as t.me/m/AbC are case-sensitive.
+    """
+    bare = re.sub(r"^(?:https?://)?(?:www\.)?", "", url.strip(), flags=re.IGNORECASE)
+    bare = bare.rstrip("/")
+    host, slash, path = bare.partition("/")
+    return host.lower() + slash + path
+
+
+def python_index(text: str, units: int) -> int:
+    """Convert a Telegram UTF-16 offset into a Python string index."""
+    count = 0
+    for index, char in enumerate(text):
+        if count >= units:
+            return index
+        count += 2 if ord(char) > 0xFFFF else 1
+    return len(text)
+
+
+def find_url_rewrites(
     text: str,
     entities: Sequence[types.TypeMessageEntity] | None,
-    old: str,
+    old_url: str,
+    label: str,
+) -> list[Rewrite]:
+    """Locate everything that links to old_url, to become label.
+
+    That is the visible text of every hyperlink pointing at old_url (the
+    "Pure Pleasure" in a post showing [Pure Pleasure](old_url)), plus any
+    literal [Text](old_url) or {Text}[old_url] typed as plain text, plus the
+    bare old_url itself.
+    """
+    key = url_key(old_url)
+    rewrites = [
+        Rewrite(
+            python_index(text, entity.offset),
+            python_index(text, entity.offset + entity.length),
+            label,
+        )
+        for entity in entities or []
+        if isinstance(entity, types.MessageEntityTextUrl) and url_key(entity.url) == key
+    ]
+
+    host, _, path = key.partition("/")
+    url_body = re.escape(host) + (("/" + re.escape(path)) if path else "")
+    url_pattern = r"(?P<url>(?:https?://)?(?:www\.)?" + url_body + r"/?)"
+    for literal in (
+        r"\[[^\[\]\n]*\]\s*\(" + url_pattern + r"\)",
+        r"\{[^{}\n]*\}\s*\[" + url_pattern + r"\]",
+        r"(?<![\w/.])" + url_pattern + r"(?![\w/])",
+    ):
+        for match in re.finditer(literal, text, re.IGNORECASE):
+            # The search ignores case for the host; the path must match exactly.
+            if url_key(match.group("url")) == key:
+                rewrites.append(Rewrite(match.start(), match.end(), label))
+    return _dedupe_rewrites(rewrites)
+
+
+def _entity_key(entity: types.TypeMessageEntity) -> tuple[object, ...]:
+    return (
+        type(entity).__name__,
+        entity.offset,
+        entity.length,
+        getattr(entity, "url", None),
+    )
+
+
+def apply_link_rewrites(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    rewrites: Sequence[Rewrite],
     label: str,
     url: str,
+    relink: Callable[[str], str],
 ) -> tuple[str, list[types.TypeMessageEntity]] | None:
-    """Turn every @old into a bold label hyperlinked to url.
+    """Replace each rewrite span with label, in bold, linked to url.
 
-    Hyperlinks elsewhere in the post that point at t.me/old are repointed at
-    url too. Any old hyperlink overlapping a new label is dropped, since one
-    piece of text can only link to one place.
+    Any old hyperlink overlapping a new label is dropped, since one piece of
+    text can only link to one place. Returns None when the post would come
+    out exactly as it is, so a second run edits nothing.
     """
-
-    def relink(target: str) -> str:
-        match = TME_RE.fullmatch(target.strip())
-        return url if match and match.group(1).lower() == old.lower() else target
-
-    rewrites = find_link_rewrites(text, old, label)
     result = apply_text_rewrites(text, entities, rewrites, relink)
     if result is None or not rewrites:
         return result
@@ -1603,15 +1695,158 @@ def rewrite_message_link(
     for start, end in spans:
         kept.append(types.MessageEntityBold(offset=start, length=end - start))
         kept.append(types.MessageEntityTextUrl(offset=start, length=end - start, url=url))
-    kept.sort(key=lambda entity: (entity.offset, -entity.length))
-    return new_text, kept
+
+    unique: dict[tuple[object, ...], types.TypeMessageEntity] = {}
+    for entity in kept:
+        unique.setdefault(_entity_key(entity), entity)
+    final = sorted(unique.values(), key=lambda entity: (entity.offset, -entity.length))
+
+    before = sorted(
+        _entity_key(entity)
+        for entity in entities or []
+        if not isinstance(entity, AUTO_ENTITIES)
+    )
+    if new_text == text and sorted(map(_entity_key, final)) == before:
+        return None
+    return new_text, final
+
+
+def tme_relinker(old: str, url: str) -> Callable[[str], str]:
+    """Repoint hyperlinks whose target is t.me/old."""
+
+    def relink(target: str) -> str:
+        match = TME_RE.fullmatch(target.strip())
+        return url if match and match.group(1).lower() == old.lower() else target
+
+    return relink
+
+
+def url_relinker(old_url: str, url: str) -> Callable[[str], str]:
+    """Repoint hyperlinks whose target is old_url."""
+    key = url_key(old_url)
+    return lambda target: url if url_key(target) == key else target
+
+
+def rewrite_message_link(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    old: str,
+    label: str,
+    url: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Turn every @old into a bold label hyperlinked to url.
+
+    Hyperlinks elsewhere in the post that point at t.me/old are repointed at
+    url too.
+    """
+    return apply_link_rewrites(
+        text, entities, find_link_rewrites(text, old, label), label, url,
+        tme_relinker(old, url),
+    )
+
+
+def rewrite_message_phrase(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    phrase: str,
+    label: str,
+    url: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Turn every occurrence of a plain phrase into a bold label linked to url.
+
+    A phrase that is already a hyperlink (the visible "Pure Pleasure" of an
+    old link) is matched like any other text, and its old target is dropped.
+    """
+    return apply_link_rewrites(
+        text, entities, find_phrase_rewrites(text, phrase, label), label, url,
+        lambda target: target,
+    )
+
+
+def rewrite_message_url(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    old_url: str,
+    label: str,
+    url: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Replace everything that links to old_url with a bold label linked to url."""
+    return apply_link_rewrites(
+        text, entities, find_url_rewrites(text, entities, old_url, label), label, url,
+        url_relinker(old_url, url),
+    )
+
+
+LinkRewriter = Callable[
+    [str, Sequence[types.TypeMessageEntity] | None],
+    tuple[str, list[types.TypeMessageEntity]] | None,
+]
+
+
+def link_rewriter_for(
+    source: str, label: str, url: str
+) -> tuple[str, LinkRewriter] | str:
+    """Work out what the left side of .change ... {Text}[url] refers to.
+
+    Returns (scope, rewriter), or an error message.
+
+    - @name or t.me/name: that username, as before.
+    - [Text](old_url) or {Text}[old_url]: whatever links to old_url.
+    - Anything else: that exact text, wherever it appears. A single bare word
+      that is also a valid username (PurePleasure) matches both the text and
+      @PurePleasure.
+    """
+    source = re.sub(r"\s+to$", "", source.strip(), flags=re.IGNORECASE)
+    if len(source) >= 2 and source[0] + source[-1] in {'""', "''", "\u201c\u201d"}:
+        source = source[1:-1].strip()
+    if not source:
+        return CHANGE_USAGE
+
+    old_link = parse_link_target(source)
+    if old_link is not None:
+        _, old_url = old_link
+        return old_url, lambda text, entities: rewrite_message_url(
+            text, entities, old_url, label, url
+        )
+
+    if source.startswith("@") or re.match(r"^(?:https?://)?t\.me/", source, re.IGNORECASE):
+        old = clean_username(source)
+        if not old:
+            return f"{source} is not a valid username."
+        return f"@{old}", lambda text, entities: rewrite_message_link(
+            text, entities, old, label, url
+        )
+
+    if USERNAME_RE.fullmatch(source):
+        word = source
+
+        def both(
+            text: str, entities: Sequence[types.TypeMessageEntity] | None
+        ) -> tuple[str, list[types.TypeMessageEntity]] | None:
+            rewrites = _dedupe_rewrites(
+                find_link_rewrites(text, word, label)
+                + find_phrase_rewrites(text, word, label)
+            )
+            return apply_link_rewrites(
+                text, entities, rewrites, label, url, tme_relinker(word, url)
+            )
+
+        return f'"{word}" and @{word}', both
+
+    return f'"{source}"', lambda text, entities: rewrite_message_phrase(
+        text, entities, source, label, url
+    )
 
 
 async def command_change_link(
-    client: TelegramClient, event: object, old: str, label: str, url: str
+    client: TelegramClient,
+    event: object,
+    scope: str,
+    label: str,
+    url: str,
+    rewrite: LinkRewriter,
 ) -> None:
-    """Replace @old in every post with a bold label linking to url."""
-    scope = f"@{old}"
+    """Replace whatever scope names in every post with a bold label linking to url."""
     info(f"Rewriting {scope} to bold link {label!r} -> {url} in chat {event.chat_id}...")
     await set_status(event, f"Rewriting {scope} to {label} ({url})...")
 
@@ -1622,7 +1857,7 @@ async def command_change_link(
         if not message.message:
             continue
 
-        result = rewrite_message_link(message.message, message.entities, old, label, url)
+        result = rewrite(message.message, message.entities)
         if result is None:
             stats.unchanged += 1
             continue
@@ -1667,28 +1902,36 @@ async def command_change_link(
 
 CHANGE_USAGE = (
     "Usage: .change @newname   or   .change @oldname @newname   or   "
-    ".change @oldname {Click Here}[https://t.me/m/abc]"
+    ".change @oldname {Click Here}[https://t.me/m/abc]   or   "
+    ".change Pure Pleasure {Pure Pleasure}[new_url]   or   "
+    ".change [Pure Pleasure](old_url) {Pure Pleasure}[new_url]"
+)
+# The new link at the very end of a .change command: {Text}[url] or [Text](url).
+TRAILING_LINK_RE = re.compile(
+    r"(?:\{[^{}]+\}\s*\[[^\[\]\s]+\]|\[[^\[\]]+\]\s*\([^()\s]+\))\s*$"
 )
 
 
 async def command_change(client: TelegramClient, event: object, args: list[str]) -> None:
-    """Rewrite usernames across every post in the current chat."""
-    # .change @old {Text}[url]: the link part may contain spaces, so it is read
-    # from the raw command text rather than the whitespace-split args.
+    """Rewrite usernames, text or links across every post in the current chat."""
+    # .change <old> {Text}[url]: both sides may contain spaces, so they are read
+    # from the raw command text rather than the whitespace-split args. The new
+    # link is whatever sits at the end; everything before it is the old side.
     match = getattr(event, "pattern_match", None)
     raw = ((match.group(2) if match else None) or " ".join(args)).strip()
-    first, _, rest = raw.partition(" ")
-    rest = re.sub(r"^to\s+", "", rest.strip(), flags=re.IGNORECASE)
-    if rest[:1] in {"{", "["}:
-        old = clean_username(first)
-        target = parse_link_target(rest)
-        if not old:
-            await set_status(event, f"{first} is not a valid username.")
-            return
+    trailing = TRAILING_LINK_RE.search(raw)
+    if trailing and raw[: trailing.start()].strip():
+        target = parse_link_target(trailing.group())
         if target is None:
             await set_status(event, CHANGE_USAGE)
             return
-        await command_change_link(client, event, old, *target)
+        label, url = target
+        found = link_rewriter_for(raw[: trailing.start()], label, url)
+        if isinstance(found, str):
+            await set_status(event, found)
+            return
+        scope, rewrite = found
+        await command_change_link(client, event, scope, label, url, rewrite)
         return
 
     if not args or len(args) > 2:
@@ -3067,6 +3310,8 @@ COMMAND_HELP = (
     ".change @newname          replace every username in every post\n"
     ".change @oldname @newname replace only that username\n"
     ".change @oldname {Text}[url]  turn it into a bold link\n"
+    ".change Some Text {Text}[url] turn that text into a bold link\n"
+    ".change [Text](old_url) {Text}[url]  repoint links to old_url\n"
     ".clone [title]            clone this chat, post by post, in order\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"
     + GATE_HELP + "\n"

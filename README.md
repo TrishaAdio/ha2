@@ -85,6 +85,8 @@ In command mode the script listens for dot commands typed **from your own accoun
 .change @newname            replace every username in every post
 .change @oldname @newname   replace only that username
 .change @oldname {Text}[url]  turn that username into a bold link
+.change Some Text {Text}[url]  turn that text into a bold link
+.change [Text](old_url) {Text}[url]  replace everything linking to old_url
 .clone [title]              clone this chat into a private channel
 .help                       show the list
 ```
@@ -100,6 +102,20 @@ Run it in a channel to rewrite usernames across the whole history. With one argu
 ```
 
 Every `@UserHehe`, and every bare `t.me/UserHehe` link, is replaced with **Click Here** in bold, linked to the URL you give. Hyperlinks elsewhere in the post that point at `t.me/UserHehe` are repointed to that URL as well. The rest of the post keeps its formatting. Standard Markdown `[Click Here](url)` works too, and so does an optional `to` (`.change @UserHehe to {Click Here}[url]`). A URL without a scheme gets `https://` added.
+
+### Turning text or an existing link into a bold link
+
+The old side does not have to be a username. When a post shows **Pure Pleasure** as a hyperlink to an old URL (no `@` anywhere), use either form:
+
+```text
+.change Pure Pleasure {Pure Pleasure}[https://t.me/m/NEW]
+.change [Pure Pleasure](https://t.me/m/OLD) {Pure Pleasure}[https://t.me/m/NEW]
+```
+
+- **Plain text** (`Pure Pleasure`): every occurrence of that text, as whole words, ignoring case and spacing, becomes the bold link. Text that was already a hyperlink loses its old target. Wrap the text in quotes if you like. A single bare word that is also a valid username (`PurePleasure`) matches both that word and `@PurePleasure`.
+- **Old link** (`[Pure Pleasure](OLD_URL)` or `{Pure Pleasure}[OLD_URL]`): matched by URL, not by text. Every hyperlink pointing at `OLD_URL` gets the new label and URL, whatever its visible text was. The bare `OLD_URL`, and `[Text](OLD_URL)` typed out as plain text, are replaced too. URLs are compared without scheme, `www.` or trailing slash; the host ignores case, the path does not (`t.me/m/` codes are case-sensitive).
+
+Posts already in the target form are left alone, so running the command twice edits nothing the second time.
 
 What it rewrites:
 

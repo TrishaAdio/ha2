@@ -339,7 +339,7 @@ A permitted person is made admin as soon as they join the **demo channel or any 
 - `.permit` sent in a DM is deleted from that chat at once, and the reply goes to your Saved Messages, so the other person sees nothing.
 - If they are already in some of the channels when you send `.permit`, they are promoted there straight away.
 - Every promotion, and every failure with its reason, is reported in your Saved Messages.
-- Joins are caught live, and every 60 seconds the newest 200 members of each watched channel are also checked, in case Telegram did not send a join update. `AUTOMAKER_PERMIT_POLL` in `.env` changes the interval in seconds; `0` turns the check off.
+- Telegram does not tell a user account when someone joins a channel, so joins are read from each channel's **Recent actions** (the admin log). Every watched channel is checked in turn, with 0.5 s between channels and a 3 s pause after a full round, so a join is usually promoted within a few seconds. With many copies a round takes longer. `AUTOMAKER_PERMIT_POLL` in `.env` changes the pause in seconds; `0` turns the checking off. Where the admin log can't be read, the newest 200 members are checked instead.
 - The list is kept in the state file, so it survives a restart. Joins only count while `main.py` mode 3 is running; anyone who joined while it was off is caught by the next check.
 
 ## The state file

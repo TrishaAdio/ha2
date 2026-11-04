@@ -1917,9 +1917,15 @@ async def command_autodel_auto(
     await command_autodel(client, event, args)
 
 
-PERMIT_POLL = float(os.getenv("AUTOMAKER_PERMIT_POLL") or 60)
+PERMIT_POLL = float(os.getenv("AUTOMAKER_PERMIT_POLL") or 3)
+PERMIT_GAP = 0.5
 PERMIT_SCAN_LIMIT = 200
 MEMBER_TYPES = (types.ChannelParticipant, types.ChannelParticipantSelf)
+JOIN_LOG_ACTIONS = (
+    types.ChannelAdminLogEventActionParticipantJoin,
+    types.ChannelAdminLogEventActionParticipantJoinByInvite,
+    types.ChannelAdminLogEventActionParticipantJoinByRequest,
+)
 
 
 class PermitWatch:
@@ -1932,6 +1938,7 @@ class PermitWatch:
         self.api_hash = api_hash
         self.in_flight: set[tuple[int, int]] = set()
         self.dialogs_read = False
+        self.log_seen: dict[int, int] = {}
         self.task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -2083,6 +2090,36 @@ class PermitWatch:
         for user_id in event.user_ids or []:
             await self.promote(channel_id, user_id)
 
+    async def joined_since(self, channel_id: int, channel: types.Channel) -> set[int] | None:
+        seen = self.log_seen.get(channel_id, 0)
+        try:
+            log = await bounded(
+                self.client,
+                functions.channels.GetAdminLogRequest(
+                    channel=channel,
+                    q="",
+                    max_id=0,
+                    min_id=seen,
+                    limit=50,
+                    events_filter=types.ChannelAdminLogEventsFilter(join=True, invite=True),
+                ),
+                label="read recent actions",
+            )
+        except (errors.ChatAdminRequiredError, errors.ChannelPrivateError):
+            return None
+        fresh = [entry for entry in getattr(log, "events", None) or [] if entry.id > seen]
+        if fresh:
+            self.log_seen[channel_id] = max(entry.id for entry in fresh)
+        joined: set[int] = set()
+        for entry in fresh:
+            if isinstance(entry.action, JOIN_LOG_ACTIONS):
+                joined.add(entry.user_id)
+            elif isinstance(entry.action, types.ChannelAdminLogEventActionParticipantInvite):
+                invited = getattr(entry.action.participant, "user_id", None)
+                if invited:
+                    joined.add(invited)
+        return joined
+
     async def sweep(self) -> int:
         wanted = {int(item["user_id"]) for item in self.state.permitted}
         if not wanted:
@@ -2091,6 +2128,12 @@ class PermitWatch:
         for channel_id in list(self.state.watched_channels()):
             channel = await self.channel(channel_id)
             if channel is None:
+                continue
+            joined = await self.joined_since(channel_id, channel)
+            if joined is not None:
+                for user_id in joined & wanted:
+                    promoted += await self.promote(channel_id, user_id)
+                await asyncio.sleep(PERMIT_GAP)
                 continue
             try:
                 members = await bounded(

@@ -308,6 +308,12 @@ def full_rights(megagroup: bool) -> types.ChatAdminRights:
     )
 
 
+def permit_rights(megagroup: bool) -> types.ChatAdminRights:
+    rights = full_rights(megagroup)
+    rights.add_admins = False
+    return rights
+
+
 @dataclass
 class MadeChat:
     """One copy of the demo channel, and the link handed over."""
@@ -392,6 +398,7 @@ class AutoState:
     # The demo channel .gen copies, by its marked peer id, and its name.
     source_id: int | None = None
     source_title: str = ""
+    permitted: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: str | Path = STATE_FILE) -> AutoState:
@@ -412,6 +419,11 @@ class AutoState:
         chat_id = source.get("chat_id")
         state.source_id = int(chat_id) if chat_id is not None else None
         state.source_title = str(source.get("title") or "")
+        state.permitted = [
+            dict(item)
+            for item in raw.get("permitted") or []
+            if isinstance(item, dict) and item.get("user_id")
+        ]
         return state
 
     def save(self) -> None:
@@ -424,6 +436,7 @@ class AutoState:
         payload = {
             "workers": [worker.to_json() for worker in self.workers],
             "source": {"chat_id": self.source_id, "title": self.source_title},
+            "permitted": self.permitted,
         }
         directory = self.path.parent if str(self.path.parent) else Path(".")
         directory.mkdir(parents=True, exist_ok=True)
@@ -477,6 +490,22 @@ class AutoState:
         """
         available = [worker for worker in self.workers if worker.available]
         return random.choice(available) if available else None
+
+    def permit_for(self, user_id: int) -> dict[str, Any] | None:
+        return next(
+            (item for item in self.permitted if int(item["user_id"]) == user_id), None
+        )
+
+    def watched_channels(self) -> dict[int, Worker | None]:
+        watched: dict[int, Worker | None] = {}
+        if self.source_id is not None:
+            bare, _kind = utils.resolve_id(self.source_id)
+            watched[bare] = None
+        for worker in self.workers:
+            for made in worker.made:
+                if made.get("chat_id"):
+                    watched[int(made["chat_id"])] = worker
+        return watched
 
     @property
     def counts(self) -> tuple[int, int, int]:
@@ -1888,6 +1917,341 @@ async def command_autodel_auto(
     await command_autodel(client, event, args)
 
 
+PERMIT_POLL = float(os.getenv("AUTOMAKER_PERMIT_POLL") or 60)
+PERMIT_SCAN_LIMIT = 200
+MEMBER_TYPES = (types.ChannelParticipant, types.ChannelParticipantSelf)
+
+
+class PermitWatch:
+    def __init__(
+        self, client: TelegramClient, state: AutoState, api_id: int, api_hash: str
+    ) -> None:
+        self.client = client
+        self.state = state
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.in_flight: set[tuple[int, int]] = set()
+        self.dialogs_read = False
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self.client.add_event_handler(
+            self.on_participant, events.Raw(types.UpdateChannelParticipant)
+        )
+        self.client.add_event_handler(self.on_action, events.ChatAction())
+        if PERMIT_POLL > 0:
+            self.task = asyncio.create_task(self.poll())
+
+    async def channel(self, channel_id: int) -> types.Channel | None:
+        for attempt in range(2):
+            try:
+                entity = await self.client.get_entity(types.PeerChannel(channel_id))
+                return entity if isinstance(entity, types.Channel) else None
+            except Exception:  # noqa: BLE001
+                if attempt or self.dialogs_read:
+                    return None
+                self.dialogs_read = True
+                with contextlib.suppress(Exception):
+                    await self.client.get_dialogs()
+        return None
+
+    async def participant(
+        self, channel: types.Channel, user: types.InputUser
+    ) -> Any | None:
+        try:
+            result = await bounded(
+                self.client,
+                functions.channels.GetParticipantRequest(channel=channel, participant=user),
+                label="check a member",
+            )
+        except errors.UserNotParticipantError:
+            return None
+        return result.participant
+
+    async def promote(
+        self, channel_id: int, user_id: int, participant: Any | None = None
+    ) -> bool:
+        item = self.state.permit_for(user_id)
+        watched = self.state.watched_channels()
+        key = (channel_id, user_id)
+        if item is None or channel_id not in watched or key in self.in_flight:
+            return False
+        self.in_flight.add(key)
+        try:
+            channel = await self.channel(channel_id)
+            if channel is None:
+                return False
+            user = types.InputUser(
+                user_id=user_id, access_hash=int(item.get("access_hash") or 0)
+            )
+            if participant is None:
+                participant = await self.participant(channel, user)
+            if not isinstance(participant, MEMBER_TYPES):
+                return False
+            name = item.get("name") or str(user_id)
+            title = utils.get_display_name(channel) or str(channel_id)
+            megagroup = bool(channel.megagroup)
+            try:
+                await bounded(
+                    self.client,
+                    functions.channels.EditAdminRequest(
+                        channel=channel,
+                        user_id=user,
+                        admin_rights=permit_rights(megagroup),
+                        rank="admin" if megagroup else "",
+                    ),
+                    label=f"promote {name}",
+                )
+                by = "your account"
+            except Exception as exc:  # noqa: BLE001
+                owner = watched[channel_id]
+                if owner is None:
+                    return await self.report_failure(name, title, exc)
+                try:
+                    await self.promote_by_worker(owner, channel_id, user_id, megagroup)
+                except Exception as worker_exc:  # noqa: BLE001
+                    return await self.report_failure(name, title, worker_exc)
+                by = owner.name
+            success(f"{name} joined {title} and was made admin by {by}.")
+            with contextlib.suppress(Exception):
+                await self.client.send_message(
+                    "me", f".permit: {name} joined {title} and is now admin ({by}).", **PLAIN
+                )
+            return True
+        finally:
+            self.in_flight.discard(key)
+
+    async def report_failure(self, name: str, title: str, exc: BaseException) -> bool:
+        if isinstance(exc, (errors.ChatAdminRequiredError, errors.RightForbiddenError)):
+            why = "the account doing it is not an admin there with the right to add admins"
+        else:
+            why = short_error(exc)
+        failure(f"Could not make {name} admin in {title}: {why}")
+        with contextlib.suppress(Exception):
+            await self.client.send_message(
+                "me", f".permit: {name} joined {title} but could not be made admin: {why}", **PLAIN
+            )
+        return False
+
+    async def promote_by_worker(
+        self, owner: Worker, channel_id: int, user_id: int, megagroup: bool
+    ) -> None:
+        worker = await worker_client(owner, self.api_id, self.api_hash)
+        try:
+            await worker.get_dialogs()
+            channel = await worker.get_input_entity(types.PeerChannel(channel_id))
+            members = await bounded(
+                worker,
+                functions.channels.GetParticipantsRequest(
+                    channel=channel,
+                    filter=types.ChannelParticipantsRecent(),
+                    offset=0,
+                    limit=PERMIT_SCAN_LIMIT,
+                    hash=0,
+                ),
+                label="read the member list",
+            )
+            found = next(
+                (u for u in getattr(members, "users", None) or [] if u.id == user_id),
+                None,
+            )
+            if found is None:
+                raise RuntimeError(f"{owner.name} cannot see them among the members")
+            await bounded(
+                worker,
+                functions.channels.EditAdminRequest(
+                    channel=channel,
+                    user_id=types.InputUser(
+                        user_id=found.id, access_hash=found.access_hash or 0
+                    ),
+                    admin_rights=permit_rights(megagroup),
+                    rank="admin" if megagroup else "",
+                ),
+                label="promote a permitted user",
+            )
+        finally:
+            await worker.disconnect()
+
+    async def on_participant(self, update: types.UpdateChannelParticipant) -> None:
+        if isinstance(update.new_participant, MEMBER_TYPES):
+            await self.promote(update.channel_id, update.user_id, update.new_participant)
+
+    async def on_action(self, event: Any) -> None:
+        if not (event.user_joined or event.user_added) or not event.is_channel:
+            return
+        channel_id, _kind = utils.resolve_id(event.chat_id)
+        for user_id in event.user_ids or []:
+            await self.promote(channel_id, user_id)
+
+    async def sweep(self) -> int:
+        wanted = {int(item["user_id"]) for item in self.state.permitted}
+        if not wanted:
+            return 0
+        promoted = 0
+        for channel_id in list(self.state.watched_channels()):
+            channel = await self.channel(channel_id)
+            if channel is None:
+                continue
+            try:
+                members = await bounded(
+                    self.client,
+                    functions.channels.GetParticipantsRequest(
+                        channel=channel,
+                        filter=types.ChannelParticipantsRecent(),
+                        offset=0,
+                        limit=PERMIT_SCAN_LIMIT,
+                        hash=0,
+                    ),
+                    label="read the member list",
+                )
+            except Exception as exc:  # noqa: BLE001
+                warning(f".permit could not read the members of {channel.title!r}: {short_error(exc)}")
+                continue
+            for member in getattr(members, "participants", None) or []:
+                user_id = getattr(member, "user_id", None)
+                if user_id in wanted and isinstance(member, MEMBER_TYPES):
+                    promoted += await self.promote(channel_id, user_id, member)
+            await asyncio.sleep(1)
+        return promoted
+
+    async def poll(self) -> None:
+        while True:
+            await asyncio.sleep(PERMIT_POLL)
+            try:
+                await self.sweep()
+            except Exception as exc:  # noqa: BLE001
+                warning(f".permit check failed: {short_error(exc)}")
+
+    async def catch_up(self, user_id: int) -> int:
+        promoted = 0
+        for channel_id in list(self.state.watched_channels()):
+            try:
+                promoted += await self.promote(channel_id, user_id)
+            except Exception as exc:  # noqa: BLE001
+                warning(f".permit could not check channel {channel_id}: {short_error(exc)}")
+            await asyncio.sleep(1)
+        return promoted
+
+
+PERMIT_USAGE = (
+    "Send .permit in their DM, reply to one of their messages with .permit, "
+    "or use .permit @user / .permit <id>. .permit list shows everyone permitted."
+)
+
+
+async def permit_target(
+    client: TelegramClient, event: Any, args: list[str]
+) -> types.User | None:
+    if args:
+        raw = args[0]
+        entity = await client.get_entity(int(raw) if raw.lstrip("-").isdigit() else raw)
+    elif getattr(event, "is_reply", False):
+        reply = await event.get_reply_message()
+        entity = await reply.get_sender()
+    elif getattr(event, "is_private", False):
+        entity = await event.get_chat()
+    else:
+        return None
+    if not isinstance(entity, types.User) or entity.is_self:
+        return None
+    return entity
+
+
+async def report_privately(client: TelegramClient, event: Any, name: str) -> Any:
+    chat = await event.get_chat()
+    if not getattr(event, "is_private", False) or getattr(chat, "is_self", False):
+        return event
+    with contextlib.suppress(Exception):
+        await event.delete()
+    where = "me" if getattr(event, "out", False) else event.sender_id
+    status_message = await client.send_message(where, f".{name}: working...", **PLAIN)
+    return StatusElsewhere(event, status_message)
+
+
+def render_permits(state: AutoState) -> str:
+    if not state.permitted:
+        return "Nobody is permitted yet. Send .permit in someone's DM."
+    lines = [f"Permitted ({len(state.permitted)}): made admin when they join"]
+    for item in state.permitted:
+        handle = f" @{item['username']}" if item.get("username") else ""
+        lines.append(f"{item.get('name') or '?'}{handle}  {item['user_id']}")
+    lines.append(f"Watching {len(state.watched_channels())} channel(s): the demo and its copies.")
+    return "\n".join(lines)
+
+
+async def command_permit(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str], watch: PermitWatch
+) -> None:
+    if args and args[0].lower() == "list":
+        await set_status(event, render_permits(state), "users")
+        return
+    event = await report_privately(client, event, "permit")
+    try:
+        user = await permit_target(client, event, args)
+    except Exception as exc:  # noqa: BLE001
+        await set_status(event, f"Cannot find {args[0]}: {short_error(exc)}")
+        return
+    if user is None:
+        await set_status(event, PERMIT_USAGE)
+        return
+
+    name = utils.get_display_name(user) or str(user.id)
+    state.permitted = [item for item in state.permitted if int(item["user_id"]) != user.id]
+    state.permitted.append(
+        {
+            "user_id": user.id,
+            "access_hash": user.access_hash or 0,
+            "name": name,
+            "username": user.username or "",
+            "added_at": now_stamp(),
+        }
+    )
+    state.save()
+    watched = len(state.watched_channels())
+    info(f"Permitted {name} ({user.id}); checking {watched} channel(s).")
+    await set_fancy(event, f"Permitted {name}. Checking {watched} channel(s)...")
+    promoted = await watch.catch_up(user.id)
+    lines = [
+        f"Permitted {name}.",
+        f"They are made admin as soon as they join the demo channel or any copy "
+        f"({watched} watched).",
+    ]
+    if promoted:
+        lines.append(f"Already a member of {promoted}: made admin there now.")
+    await set_fancy(event, "\n".join(lines), done=True)
+
+
+async def command_unpermit(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str], _watch: PermitWatch
+) -> None:
+    event = await report_privately(client, event, "unpermit")
+    if args and args[0].lstrip("-").isdigit():
+        user_id: int | None = int(args[0])
+    else:
+        try:
+            user = await permit_target(client, event, args)
+        except Exception as exc:  # noqa: BLE001
+            await set_status(event, f"Cannot find {args[0]}: {short_error(exc)}")
+            return
+        user_id = user.id if user is not None else None
+    if user_id is None:
+        await set_status(event, PERMIT_USAGE.replace(".permit", ".unpermit"))
+        return
+    item = state.permit_for(user_id)
+    if item is None:
+        await set_status(event, "They were not permitted.")
+        return
+    state.permitted = [entry for entry in state.permitted if int(entry["user_id"]) != user_id]
+    state.save()
+    name = item.get("name") or str(user_id)
+    await set_fancy(
+        event,
+        f"{name} is no longer permitted. Admin rights already given stay; "
+        "remove them in the channel if needed.",
+        done=True,
+    )
+
+
 COMMAND_HELP = (
     "Auto maker\n"
     ".set [link]            choose the demo channel (send it in the channel)\n"
@@ -1897,6 +2261,8 @@ COMMAND_HELP = (
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".ids [all]             IDs of finished, live copies (all = with dead)\n"
+    ".permit [@user|list]   make them admin when they join (send in their DM)\n"
+    ".unpermit [@user|id]   stop doing that for them\n"
     ".autodel [on|off|...]  delete quick replies 1-2 h after sending\n"
     ".reset [name|all]      free spent and set-aside workers\n"
     ".remove <name|aside|cuties|all>  forget workers (cuties = frozen/spam)\n"
@@ -1921,6 +2287,10 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "remove": command_remove,
     "terminate": command_terminate,
 }
+PERMIT_COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
+    "permit": command_permit,
+    "unpermit": command_unpermit,
+}
 
 
 async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> None:
@@ -1933,6 +2303,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
     # in that chat: the answers are plain messages and a stray command in the
     # middle of the flow would be read as one of them.
     awaiting: set[int] = set()
+    watch = PermitWatch(client, state, api_id, api_hash)
 
     @client.on(events.NewMessage(pattern=COMMAND_PATTERN, func=gate.allows))
     async def dispatch(event: Any) -> None:
@@ -1952,6 +2323,15 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
         except Exception as exc:  # noqa: BLE001
             failure(f".{name} failed: {exc}")
             await set_status(event, f".{name} failed: {exc}")
+            return
+        if name in PERMIT_COMMANDS:
+            try:
+                await PERMIT_COMMANDS[name](
+                    client, state, event, raw_args.split() if raw_args else [], watch
+                )
+            except Exception as exc:  # noqa: BLE001
+                failure(f".{name} failed: {exc}")
+                await set_status(event, f".{name} failed: {exc}")
             return
         handler = COMMANDS.get(name)
         if handler is None:
@@ -1987,5 +2367,8 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
         warning("No workers yet. Send .login to add one.")
     report_gate(gate)
     start_autodelete(client)
+    watch.start()
+    if state.permitted:
+        info(f"Permitted: {len(state.permitted)} user(s) are made admin when they join.")
     info("Send the commands from this account, or an admin's, in any chat. Ctrl+C to stop.")
     await client.run_until_disconnected()

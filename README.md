@@ -270,6 +270,8 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 .gen [count]           make copies of the demo channel
 .login [phone]         add a worker account (phone, code, 2FA)
 .accounts              list the workers and the demo channel
+.permit [@user|list]   make them admin when they join (send in their DM)
+.unpermit [@user|id]   stop doing that for them
 .reset [name|all]      free spent and set-aside workers
 .remove <name|aside|all>  forget workers and their sessions
 .cancel                stop a login that is waiting
@@ -321,6 +323,24 @@ A worker is marked used once its channel exists, because its limit is spent at t
 - A wrong code or password can be retried three times.
 - A number with no Telegram account is refused; sign it up in a Telegram app first.
 - Re-adding an account that is already stored refreshes its session instead of adding it twice.
+
+## `.permit`
+
+```text
+.permit                # send in someone's DM: they become admin when they join
+.permit @user          # same, from anywhere (also: a numeric id, or reply to them)
+.permit list           # everyone permitted
+.unpermit [@user|id]   # stop it for them (rights already given stay)
+```
+
+A permitted person is made admin as soon as they join the **demo channel or any copy `.gen` made**. Your account does the promotion. In a copy where it can't, the worker that owns the copy does it instead. The demo channel has no worker, so there your account must be an admin with the right to add admins.
+
+- They get the same full rights your account has, **except adding admins**, so they cannot promote anyone else.
+- `.permit` sent in a DM is deleted from that chat at once, and the reply goes to your Saved Messages, so the other person sees nothing.
+- If they are already in some of the channels when you send `.permit`, they are promoted there straight away.
+- Every promotion, and every failure with its reason, is reported in your Saved Messages.
+- Joins are caught live, and every 60 seconds the newest 200 members of each watched channel are also checked, in case Telegram did not send a join update. `AUTOMAKER_PERMIT_POLL` in `.env` changes the interval in seconds; `0` turns the check off.
+- The list is kept in the state file, so it survives a restart. Joins only count while `main.py` mode 3 is running; anyone who joined while it was off is caught by the next check.
 
 ## The state file
 

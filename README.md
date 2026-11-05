@@ -117,6 +117,14 @@ The old side does not have to be a username. When a post shows **Pure Pleasure**
 
 Posts already in the target form are left alone, so running the command twice edits nothing the second time.
 
+### Turning text into a plain @username
+
+```text
+.change Pure Pleasure @iPleasureGiver
+```
+
+Every occurrence of the text (matched the same way as above) becomes a plain `@iPleasureGiver`, which Telegram shows as a mention. The link, bold or other styling that sat on those words is removed, and so is any custom emoji right after them, such as a verified tick. Styling that also covers other words, like a bold whole line, stays. With only one word before the `@name`, such as `.change PurePleasure @new`, the old username swap below is used instead.
+
 What it rewrites:
 
 - `@mentions` in message text and in media captions.

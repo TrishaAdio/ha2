@@ -1783,43 +1783,19 @@ LinkRewriter = Callable[
 ]
 
 
-def swallow_trailing_emoji(
-    text: str,
-    entities: Sequence[types.TypeMessageEntity] | None,
-    rewrite: Rewrite,
-) -> Rewrite:
-    """Extend a rewrite over custom emoji right after it, such as a verified tick."""
-    emoji_at = {
-        entity.offset: entity.offset + entity.length
-        for entity in entities or []
-        if isinstance(entity, types.MessageEntityCustomEmoji)
-    }
-    end = rewrite.end
-    while True:
-        cursor = end
-        while cursor < len(text) and text[cursor] in " \t\u00a0":
-            cursor += 1
-        emoji_end = emoji_at.get(utf16_offset(text, cursor))
-        if emoji_end is None:
-            return Rewrite(rewrite.start, end, rewrite.replacement)
-        end = python_index(text, emoji_end)
-
-
 def rewrite_message_plain(
     text: str,
     entities: Sequence[types.TypeMessageEntity] | None,
     phrase: str,
     replacement: str,
 ) -> tuple[str, list[types.TypeMessageEntity]] | None:
-    """Replace a phrase, and any custom emoji right after it, with plain text.
+    """Replace a phrase with plain text, keeping everything around it.
 
     Links and styling that sat only on the replaced words are dropped, so the
-    result is the bare replacement, which Telegram shows as a mention.
+    result is the bare replacement, which Telegram shows as a mention. Custom
+    emoji next to the phrase are kept and moved along with the text.
     """
-    rewrites = [
-        swallow_trailing_emoji(text, entities, rewrite)
-        for rewrite in find_phrase_rewrites(text, phrase, replacement)
-    ]
+    rewrites = find_phrase_rewrites(text, phrase, replacement)
     result = apply_text_rewrites(text, entities, rewrites, lambda target: target)
     if result is None or not rewrites:
         return result

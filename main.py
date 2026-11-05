@@ -1783,6 +1783,65 @@ LinkRewriter = Callable[
 ]
 
 
+def swallow_trailing_emoji(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    rewrite: Rewrite,
+) -> Rewrite:
+    """Extend a rewrite over custom emoji right after it, such as a verified tick."""
+    emoji_at = {
+        entity.offset: entity.offset + entity.length
+        for entity in entities or []
+        if isinstance(entity, types.MessageEntityCustomEmoji)
+    }
+    end = rewrite.end
+    while True:
+        cursor = end
+        while cursor < len(text) and text[cursor] in " \t\u00a0":
+            cursor += 1
+        emoji_end = emoji_at.get(utf16_offset(text, cursor))
+        if emoji_end is None:
+            return Rewrite(rewrite.start, end, rewrite.replacement)
+        end = python_index(text, emoji_end)
+
+
+def rewrite_message_plain(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    phrase: str,
+    replacement: str,
+) -> tuple[str, list[types.TypeMessageEntity]] | None:
+    """Replace a phrase, and any custom emoji right after it, with plain text.
+
+    Links and styling that sat only on the replaced words are dropped, so the
+    result is the bare replacement, which Telegram shows as a mention.
+    """
+    rewrites = [
+        swallow_trailing_emoji(text, entities, rewrite)
+        for rewrite in find_phrase_rewrites(text, phrase, replacement)
+    ]
+    result = apply_text_rewrites(text, entities, rewrites, lambda target: target)
+    if result is None or not rewrites:
+        return result
+    new_text, moved = result
+
+    spans: list[tuple[int, int]] = []
+    shift = 0
+    replacement_units = utf16_length(replacement)
+    for rewrite in rewrites:
+        start = utf16_offset(text, rewrite.start) + shift
+        spans.append((start, start + replacement_units))
+        shift += replacement_units - (
+            utf16_offset(text, rewrite.end) - utf16_offset(text, rewrite.start)
+        )
+
+    def inside(entity: types.TypeMessageEntity) -> bool:
+        end = entity.offset + entity.length
+        return any(s_start <= entity.offset and end <= s_end for s_start, s_end in spans)
+
+    return new_text, [entity for entity in moved if not inside(entity)]
+
+
 def link_rewriter_for(
     source: str, label: str, url: str
 ) -> tuple[str, LinkRewriter] | str:
@@ -1843,12 +1902,13 @@ async def command_change_link(
     event: object,
     scope: str,
     label: str,
-    url: str,
+    url: str | None,
     rewrite: LinkRewriter,
 ) -> None:
-    """Replace whatever scope names in every post with a bold label linking to url."""
-    info(f"Rewriting {scope} to bold link {label!r} -> {url} in chat {event.chat_id}...")
-    await set_status(event, f"Rewriting {scope} to {label} ({url})...")
+    """Replace whatever scope names in every post with label, linked to url if given."""
+    target = f"{label} ({url})" if url else label
+    info(f"Rewriting {scope} to {target} in chat {event.chat_id}...")
+    await set_status(event, f"Rewriting {scope} to {target}...")
 
     stats = ChangeStats()
     async for message in client.iter_messages(event.chat_id):
@@ -1889,7 +1949,7 @@ async def command_change_link(
             await set_status(event, f"Rewriting {scope} to {label}... {stats.edited} edited")
         await asyncio.sleep(EDIT_DELAY)
 
-    summary = f"Rewrote {scope} to {label} ({url}): {stats.edited} edited"
+    summary = f"Rewrote {scope} to {target}: {stats.edited} edited"
     if stats.unchanged:
         summary += f", {stats.unchanged} already fine"
     if stats.locked:
@@ -1904,6 +1964,7 @@ CHANGE_USAGE = (
     "Usage: .change @newname   or   .change @oldname @newname   or   "
     ".change @oldname {Click Here}[https://t.me/m/abc]   or   "
     ".change Pure Pleasure {Pure Pleasure}[new_url]   or   "
+    ".change Pure Pleasure @newname   or   "
     ".change [Pure Pleasure](old_url) {Pure Pleasure}[new_url]"
 )
 # The new link at the very end of a .change command: {Text}[url] or [Text](url).
@@ -1932,6 +1993,25 @@ async def command_change(client: TelegramClient, event: object, args: list[str])
             return
         scope, rewrite = found
         await command_change_link(client, event, scope, label, url, rewrite)
+        return
+
+    plain_target = args[-1] if len(args) >= 2 and args[-1].startswith("@") else None
+    if plain_target and (len(args) > 2 or clean_username(args[0]) is None):
+        new = clean_username(plain_target)
+        if not new:
+            await set_status(event, f"{plain_target} is not a valid username.")
+            return
+        phrase = raw[: raw.rfind(plain_target)].strip()
+        if len(phrase) >= 2 and phrase[0] + phrase[-1] in {'""', "''", "\u201c\u201d"}:
+            phrase = phrase[1:-1].strip()
+        await command_change_link(
+            client,
+            event,
+            f'"{phrase}"',
+            f"@{new}",
+            None,
+            lambda text, entities: rewrite_message_plain(text, entities, phrase, f"@{new}"),
+        )
         return
 
     if not args or len(args) > 2:
@@ -3311,6 +3391,7 @@ COMMAND_HELP = (
     ".change @oldname @newname replace only that username\n"
     ".change @oldname {Text}[url]  turn it into a bold link\n"
     ".change Some Text {Text}[url] turn that text into a bold link\n"
+    ".change Some Text @newname    replace that text with a plain @newname\n"
     ".change [Text](old_url) {Text}[url]  repoint links to old_url\n"
     ".clone [title]            clone this chat, post by post, in order\n"
     ".clone <link> [title]     clone that chat, by invite link or @handle\n"

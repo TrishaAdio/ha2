@@ -123,7 +123,7 @@ Posts already in the target form are left alone, so running the command twice ed
 .change Pure Pleasure @iPleasureGiver
 ```
 
-Every occurrence of the text (matched the same way as above) becomes a plain `@iPleasureGiver`, which Telegram shows as a mention. The link, bold or other styling that sat on those words is removed, and so is any custom emoji right after them, such as a verified tick. Styling that also covers other words, like a bold whole line, stays. With only one word before the `@name`, such as `.change PurePleasure @new`, the old username swap below is used instead.
+Every occurrence of the text (matched the same way as above) becomes a plain `@iPleasureGiver`, which Telegram shows as a mention. The link, bold or other styling that sat on those words is removed. Custom emoji next to the text, such as a verified tick, are kept where they are. Styling that also covers other words, like a bold whole line, stays. With only one word before the `@name`, such as `.change PurePleasure @new`, the old username swap below is used instead.
 
 What it rewrites:
 

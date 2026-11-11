@@ -2349,6 +2349,7 @@ class GenEffects:
     fun: bool = False
     scramble: bool = True
     seen_orders: set[tuple[int, ...]] = field(default_factory=set, compare=False, repr=False)
+    seen_texts: set[str] = field(default_factory=set, compare=False, repr=False)
 
 
 FUN_SWAPS = {
@@ -2356,8 +2357,14 @@ FUN_SWAPS = {
     "o": "0", "O": "0", "s": "5", "S": "5", "t": "7", "T": "7",
     "b": "8", "g": "9", "l": "1",
 }
-FUN_SWAP_CHANCE = 0.6
-FUN_MIN_WORD = 3
+# How many of a post's eligible words get a swapped letter, and the most any
+# one post gets. Kept low on purpose: a couple of swaps make each copy unique
+# while every word still reads as itself.
+FUN_RATE = 0.2
+FUN_MAX_SWAPS = 3
+# Only words at least this long are touched, and never their first or last
+# letter, so nothing reads as a missing letter ("Inquiry" as "!nquiry").
+FUN_MIN_WORD = 5
 # Letters inside these are left alone, so a link, @name or code still works.
 FUN_PROTECTED = (
     types.MessageEntityUrl,
@@ -2392,13 +2399,13 @@ def apply_fun_text(
     entities: Sequence[types.TypeMessageEntity] | None,
     rng: random.Random,
 ) -> str:
-    """Swap one letter in some words for a lookalike, keeping the text's length.
+    """Swap a letter inside a few words for a lookalike, keeping the length.
 
-    At most one letter per word changes, so every word stays readable. Every
-    swap is one BMP character for another, so entity offsets and lengths still
-    line up and no formatting moves. Links, mentions, code and custom emoji are
-    left untouched, and an @ never starts a word, where Telegram would turn it
-    into a mention of some stranger's account.
+    A handful of words per post get exactly one letter changed, never their
+    first or last, so each copy is unique and every word still reads as itself.
+    Every swap is one BMP character for another, so entity offsets and lengths
+    still line up and no formatting moves. Links, mentions, code and custom
+    emoji are skipped entirely so they keep working.
     """
     protected = _protected_units(entities)
     characters = list(text)
@@ -2408,19 +2415,24 @@ def apply_fun_text(
         units.append(position)
         position += 2 if ord(character) > 0xFFFF else 1
 
+    choices: list[list[int]] = []
     for word in re.finditer(r"[A-Za-z]+", text):
-        if word.end() - word.start() < FUN_MIN_WORD or rng.random() >= FUN_SWAP_CHANCE:
+        if word.end() - word.start() < FUN_MIN_WORD:
             continue
-        candidates = [
+        inner = [
             index
-            for index in range(word.start(), word.end())
-            if characters[index] in FUN_SWAPS
-            and units[index] not in protected
-            and not (FUN_SWAPS[characters[index]] == "@" and index == word.start())
+            for index in range(word.start() + 1, word.end() - 1)
+            if characters[index] in FUN_SWAPS and units[index] not in protected
         ]
-        if candidates:
-            index = rng.choice(candidates)
-            characters[index] = FUN_SWAPS[characters[index]]
+        if inner:
+            choices.append(inner)
+    if not choices:
+        return text
+
+    wanted = min(FUN_MAX_SWAPS, max(1, round(len(choices) * FUN_RATE)))
+    for inner in rng.sample(choices, wanted):
+        index = rng.choice(inner)
+        characters[index] = FUN_SWAPS[characters[index]]
     return "".join(characters)
 
 
@@ -2466,12 +2478,29 @@ def scramble_photo_posts(
     return result
 
 
-def fun_message(message: Message, rng: random.Random) -> Message:
-    """Return a shallow copy of a message with .fun applied to its text."""
+FUN_TRIES = 12
+
+
+def fun_message(
+    message: Message, rng: random.Random, seen: set[str] | None = None
+) -> Message:
+    """Return a shallow copy of a message with .fun applied to its text.
+
+    Keeping a few swaps per post makes two copies land on the same wording now
+    and then, so a text already used by an earlier copy of the same run is
+    rolled again.
+    """
     if not message.message:
         return message
+    text = apply_fun_text(message.message, message.entities, rng)
+    if seen is not None:
+        for _ in range(FUN_TRIES):
+            if text not in seen:
+                break
+            text = apply_fun_text(message.message, message.entities, rng)
+        seen.add(text)
     altered = copy.copy(message)
-    altered.message = apply_fun_text(message.message, message.entities, rng)
+    altered.message = text
     return altered
 
 
@@ -2487,7 +2516,10 @@ def transform_plan(
     if effects.scramble:
         posts = scramble_photo_posts(posts, rng, effects.seen_orders)
     if effects.fun:
-        posts = [[fun_message(part, rng) for part in batch] for batch in posts]
+        posts = [
+            [fun_message(part, rng, effects.seen_texts) for part in batch]
+            for batch in posts
+        ]
     return ClonePlan(posts=posts, skipped_traces=plan.skipped_traces)
 
 
@@ -3132,16 +3164,17 @@ async def clone_one_post(
         effects and effects.watermark and any(message.photo for message in batch)
     )
     # (label, re-upload the media, keep premium emoji)
+    # Every way of sending the media is tried before any attempt that gives up
+    # the premium emoji, so an expired file reference costs a re-upload rather
+    # than the post's custom emoji.
     if must_reupload:
         attempts: list[tuple[str, bool, bool]] = [("watermarked", True, True)]
         if premium:
             attempts.append(("watermarked without premium emoji", True, False))
     else:
-        attempts = [("as is", False, True)]
+        attempts = [("as is", False, True), ("re-uploaded", True, True)]
         if premium:
             attempts.append(("without premium emoji", False, False))
-        attempts.append(("re-uploaded", True, True))
-        if premium:
             attempts.append(("re-uploaded without premium emoji", True, False))
 
     # The newest message of the clone known before this post: whatever arrives

@@ -2647,7 +2647,8 @@ COMMAND_TRACE_RE = re.compile(
 # admin sent is theirs, so it is matched whoever sent it.
 DOT_COMMAND_RE = re.compile(
     r"^\.(?:clone|change|help|allow|deny|admins"
-    r"|set|gen|login|accounts|reset|remove|cancel)\b[^\n]*$"
+    r"|set|gen|login|accounts|reset|remove|cancel"
+    r"|upgrade|delete|save|fun|spoiler|permit|unpermit|ids|session|terminate|autodel)\b[^\n]*$"
 )
 
 

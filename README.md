@@ -278,6 +278,9 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 .gen [count]           make copies of the demo channel
 .login [phone]         add a worker account (phone, code, 2FA)
 .accounts              list the workers and the demo channel
+.save dps              send 6 photos; each copy gets one as its PFP
+.fun [on|off]          readable letter swaps in captions/text per copy
+.spoiler [on|off]      send photos hidden behind a tap (default on)
 .permit [@user|list]   make them admin when they join (send in their DM)
 .unpermit [@user|id]   stop doing that for them
 .reset [name|all]      free spent and set-aside workers
@@ -313,6 +316,26 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 5. Your account exports the invite link. It comes back in the reply to `.gen`, and a full report goes to your Saved Messages. **Nothing is posted in the demo channel.**
 
 Your account does the posting, so premium emoji come through. The worker spends its own channel-creation limit, so yours never runs out. The link is yours, so it keeps working whatever happens to the worker.
+
+## Per-copy effects
+
+Four extras make every `.gen` copy look different from the demo channel and from each other. They need Pillow (`pip install -r requirements.txt` installs it). They apply only to `.gen`; `.clone` is untouched.
+
+```text
+.save dps          # send 6 photos; each copy gets one at random as its PFP
+.fun on            # readable letter swaps in captions and text (a->@, i->!)
+.fun off
+.spoiler on        # every photo hidden behind a tap (this is the default)
+.spoiler off
+```
+
+- **Random profile photo.** After `.save dps` you send six photos one at a time; they are stored under `automaker_dps/` (`AUTOMAKER_DP_DIR` moves it). Each copy picks one at random for its profile photo instead of the demo channel's. With none saved, the demo channel's own photo is used.
+- **Watermark.** Every photo is stamped with *Your Pleasure Is Not A Sin* at a random spot in its lower part, which moves from photo to photo and copy to copy. The text is sized to fit the photo and has a shadow so it reads on light and dark images. Set `AUTOMAKER_WATERMARK` in `.env` to change the words, or to an empty value to turn it off. Only photos are stamped; stickers, videos and files are left alone.
+- **Scramble.** The photo posts are shuffled into a new order for each copy, never the demo channel's own order, and a different order for each copy in one `.gen` run whenever there are enough photo posts to allow it. A link to a photo post still opens that photo at its new spot. Text posts, markdown-link posts and stickers keep their original position; only the slots that held a photo post are reshuffled. The order check still passes, because the copy is verified against its own scrambled order.
+- **`.fun`.** When on, one letter in some words of captions and text posts is swapped for a lookalike (`a`→`@`, `i`→`!`, `e`→`3`, and so on), a fresh random mix for each copy. At most one letter per word changes so it stays readable, and `@` never starts a word, where Telegram would make it a mention of a stranger's account. Swaps are the same length as the original, so formatting never shifts, and anything inside a link, `@mention`, email, hashtag, code or custom emoji is left intact so it keeps working.
+- **`.spoiler`.** On by default: every photo is sent with its image hidden behind a tap, while the caption stays visible. Turn it off to send photos shown (a photo the demo channel itself marked as a spoiler stays a spoiler either way).
+
+`.accounts` shows the current state of all four. The settings live in `automaker_state.json`, so they survive a restart.
 
 ## When something goes wrong
 

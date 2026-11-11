@@ -14,6 +14,7 @@ import copy
 import getpass
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -2323,7 +2324,247 @@ def channel_from_updates(updates: object) -> types.Channel:
     raise RuntimeError("Telegram did not return the new channel.")
 
 
-def clone_input_media(message: Message) -> object | None:
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+except ImportError:  # Pillow is only needed for the watermark in mode 3.
+    PIL_AVAILABLE = False
+
+
+@dataclass
+class GenEffects:
+    """Transformations the auto maker applies to each demo copy it makes.
+
+    spoiler   every photo is sent with its media hidden behind a tap, the
+              caption staying visible.
+    watermark text stamped at a random spot on each photo, or None for none.
+    fun       readable letter swaps in captions and text posts (a to @, i to !).
+    scramble  photo posts are shuffled among themselves; text, link and sticker
+              posts keep their place.
+    """
+
+    spoiler: bool = True
+    watermark: str | None = None
+    fun: bool = False
+    scramble: bool = True
+    seen_orders: set[tuple[int, ...]] = field(default_factory=set, compare=False, repr=False)
+
+
+FUN_SWAPS = {
+    "a": "@", "A": "@", "i": "!", "I": "!", "e": "3", "E": "3",
+    "o": "0", "O": "0", "s": "5", "S": "5", "t": "7", "T": "7",
+    "b": "8", "g": "9", "l": "1",
+}
+FUN_SWAP_CHANCE = 0.6
+FUN_MIN_WORD = 3
+# Letters inside these are left alone, so a link, @name or code still works.
+FUN_PROTECTED = (
+    types.MessageEntityUrl,
+    types.MessageEntityTextUrl,
+    types.MessageEntityMention,
+    types.MessageEntityMentionName,
+    types.InputMessageEntityMentionName,
+    types.MessageEntityEmail,
+    types.MessageEntityHashtag,
+    types.MessageEntityCashtag,
+    types.MessageEntityBotCommand,
+    types.MessageEntityCode,
+    types.MessageEntityPre,
+    types.MessageEntityCustomEmoji,
+    types.MessageEntityBankCard,
+)
+
+
+def _protected_units(
+    entities: Sequence[types.TypeMessageEntity] | None,
+) -> set[int]:
+    """Return the UTF-16 positions .fun must not touch."""
+    protected: set[int] = set()
+    for entity in entities or []:
+        if isinstance(entity, FUN_PROTECTED):
+            protected.update(range(entity.offset, entity.offset + entity.length))
+    return protected
+
+
+def apply_fun_text(
+    text: str,
+    entities: Sequence[types.TypeMessageEntity] | None,
+    rng: random.Random,
+) -> str:
+    """Swap one letter in some words for a lookalike, keeping the text's length.
+
+    At most one letter per word changes, so every word stays readable. Every
+    swap is one BMP character for another, so entity offsets and lengths still
+    line up and no formatting moves. Links, mentions, code and custom emoji are
+    left untouched, and an @ never starts a word, where Telegram would turn it
+    into a mention of some stranger's account.
+    """
+    protected = _protected_units(entities)
+    characters = list(text)
+    units: list[int] = []
+    position = 0
+    for character in characters:
+        units.append(position)
+        position += 2 if ord(character) > 0xFFFF else 1
+
+    for word in re.finditer(r"[A-Za-z]+", text):
+        if word.end() - word.start() < FUN_MIN_WORD or rng.random() >= FUN_SWAP_CHANCE:
+            continue
+        candidates = [
+            index
+            for index in range(word.start(), word.end())
+            if characters[index] in FUN_SWAPS
+            and units[index] not in protected
+            and not (FUN_SWAPS[characters[index]] == "@" and index == word.start())
+        ]
+        if candidates:
+            index = rng.choice(candidates)
+            characters[index] = FUN_SWAPS[characters[index]]
+    return "".join(characters)
+
+
+def is_photo_post(batch: Sequence[Message]) -> bool:
+    """Return whether every part of a post is a photo."""
+    return bool(batch) and all(part.photo for part in batch)
+
+
+SCRAMBLE_TRIES = 200
+
+
+def scramble_photo_posts(
+    posts: list[list[Message]],
+    rng: random.Random,
+    seen: set[tuple[int, ...]] | None = None,
+) -> list[list[Message]]:
+    """Shuffle the photo posts among their own slots, leaving the rest in place.
+
+    A text, link or sticker post keeps its position; only the slots that held a
+    photo post are refilled, with those same photo posts in a new order. The
+    order always differs from the source's, and from every order in seen when
+    enough orders exist, so each copy of one .gen run is scrambled its own way.
+    """
+    slots = [index for index, batch in enumerate(posts) if is_photo_post(batch)]
+    if len(slots) < 2:
+        return list(posts)
+    original = [posts[index] for index in slots]
+    used = seen if seen is not None else set()
+    identity = tuple(batch[0].id for batch in original)
+    shuffled = list(original)
+    for _attempt in range(SCRAMBLE_TRIES):
+        rng.shuffle(shuffled)
+        order = tuple(batch[0].id for batch in shuffled)
+        if order != identity and order not in used:
+            break
+    else:
+        while tuple(batch[0].id for batch in shuffled) == identity:
+            rng.shuffle(shuffled)
+    used.add(tuple(batch[0].id for batch in shuffled))
+    result = list(posts)
+    for index, batch in zip(slots, shuffled):
+        result[index] = batch
+    return result
+
+
+def fun_message(message: Message, rng: random.Random) -> Message:
+    """Return a shallow copy of a message with .fun applied to its text."""
+    if not message.message:
+        return message
+    altered = copy.copy(message)
+    altered.message = apply_fun_text(message.message, message.entities, rng)
+    return altered
+
+
+def transform_plan(
+    plan: ClonePlan, effects: GenEffects, rng: random.Random
+) -> ClonePlan:
+    """Build a per-copy plan with .fun text swaps and photo-post scrambling.
+
+    The original plan is left untouched, so each copy in one .gen run gets its
+    own ordering and its own letter swaps.
+    """
+    posts = plan.posts
+    if effects.scramble:
+        posts = scramble_photo_posts(posts, rng, effects.seen_orders)
+    if effects.fun:
+        posts = [[fun_message(part, rng) for part in batch] for batch in posts]
+    return ClonePlan(posts=posts, skipped_traces=plan.skipped_traces)
+
+
+WATERMARK_TOP = 0.55
+WATERMARK_MAX_WIDTH = 0.8
+WATERMARK_FONTS = (
+    "DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "arialbd.ttf",
+    "Arial Bold.ttf",
+)
+
+
+def watermark_font(size: int) -> object:
+    """Return a bold font at size, or Pillow's own scalable font."""
+    for candidate in WATERMARK_FONTS:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def watermark_image(path: str, text: str, rng: random.Random) -> None:
+    """Stamp text at a random spot on the image at path, in place.
+
+    Falls back to doing nothing, with a warning, when Pillow is not installed,
+    so a copy is still made rather than failing outright.
+    """
+    if not text:
+        return
+    if not PIL_AVAILABLE:
+        warning("Pillow is not installed, so the watermark was skipped (pip install Pillow).")
+        return
+    with Image.open(path) as opened:
+        base = opened.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    width, height = base.size
+    font_size = max(12, min(width, height) // 16)
+    while True:
+        font = watermark_font(font_size)
+        box = draw.textbbox((0, 0), text, font=font)
+        text_width, text_height = box[2] - box[0], box[3] - box[1]
+        if text_width <= width * WATERMARK_MAX_WIDTH or font_size <= 10:
+            break
+        font_size = max(10, int(font_size * 0.9))
+
+    margin = max(4, width // 50)
+    shadow = max(1, font_size // 18)
+    max_x = max(margin, width - text_width - margin - box[0])
+    top = max(0, int(height * WATERMARK_TOP))
+    max_y = max(top, height - text_height - margin - box[1])
+    x = rng.randint(min(margin, max_x), max_x)
+    y = rng.randint(min(top, max_y), max_y)
+
+    draw.text((x + shadow, y + shadow), text, font=font, fill=(0, 0, 0, 150))
+    draw.text((x, y), text, font=font, fill=(255, 255, 255, 200))
+
+    stamped = Image.alpha_composite(base, overlay).convert("RGB")
+    stamped.save(path, format="JPEG", quality=90)
+
+
+def media_spoiler(message: Message, effects: GenEffects | None) -> bool:
+    """Return whether a cloned photo should be hidden behind a spoiler tap."""
+    if effects is not None and message.photo and effects.spoiler:
+        return True
+    return has_media_spoiler(message)
+
+
+def clone_input_media(
+    message: Message, effects: GenEffects | None = None
+) -> object | None:
     """Reuse the existing file for a clone, or None when the post is text."""
     media = message.media
     if media is None or isinstance(media, types.MessageMediaWebPage):
@@ -2332,7 +2573,7 @@ def clone_input_media(message: Message) -> object | None:
     if isinstance(input_media, types.InputMediaEmpty):
         raise TypeError(f"{type(media).__name__} cannot be resent")
     if hasattr(input_media, "spoiler"):
-        input_media.spoiler = has_media_spoiler(message)
+        input_media.spoiler = media_spoiler(message, effects)
     return input_media
 
 
@@ -2590,6 +2831,30 @@ async def outgoing_entities(
     return prepared
 
 
+async def album_ready_media(
+    client: TelegramClient, target: types.Channel, media: object
+) -> object:
+    """Turn a freshly uploaded file into media an album will accept.
+
+    Telegram refuses an uploaded photo or document inside sendMultiMedia; it
+    has to be registered with uploadMedia first, which is what Telethon does
+    for its own albums. The spoiler flag does not survive that round trip, so
+    it is put back on the result.
+    """
+    if not isinstance(media, (types.InputMediaUploadedPhoto, types.InputMediaUploadedDocument)):
+        return media
+    uploaded = await retry_on_wait(
+        client, functions.messages.UploadMediaRequest(peer=target, media=media)
+    )
+    if isinstance(media, types.InputMediaUploadedPhoto):
+        ready = utils.get_input_media(uploaded.photo)
+    else:
+        ready = utils.get_input_media(uploaded.document)
+    if hasattr(ready, "spoiler"):
+        ready.spoiler = bool(getattr(media, "spoiler", False))
+    return ready
+
+
 async def send_clone_batch(
     client: TelegramClient,
     target: types.Channel,
@@ -2613,13 +2878,14 @@ async def send_clone_batch(
         return prepared[message.id]
 
     if len(batch) > 1:
+        ready = [await album_ready_media(client, target, media) for media in medias]
         items = [
             types.InputSingleMedia(
                 media=media,
                 message=message.message or "",
                 entities=entities_of(message),
             )
-            for message, media in zip(batch, medias, strict=True)
+            for message, media in zip(batch, ready, strict=True)
         ]
         query = functions.messages.SendMultiMediaRequest(
             peer=target, multi_media=items, reply_to=reply_to
@@ -2726,9 +2992,16 @@ async def find_landed(
 
 
 async def reuploaded_media(
-    client: TelegramClient, message: Message, directory: Path
+    client: TelegramClient,
+    message: Message,
+    directory: Path,
+    effects: GenEffects | None = None,
 ) -> object | None:
-    """Download and upload a post's media when its reference cannot be reused."""
+    """Download and upload a post's media when its reference cannot be reused.
+
+    When effects ask for a watermark, each photo is stamped before it goes back
+    up; stickers, files and videos are left exactly as they were.
+    """
     if message.media is None or isinstance(message.media, types.MessageMediaWebPage):
         return None
     path = await retry_on_wait(
@@ -2736,16 +3009,18 @@ async def reuploaded_media(
     )
     if not path:
         raise RuntimeError(f"could not download media of message {message.id}")
+    if message.photo and effects is not None and effects.watermark:
+        watermark_image(path, effects.watermark, random)
     handle = await retry_on_wait(client.upload_file, path)
     if message.photo:
         return types.InputMediaUploadedPhoto(
-            file=handle, spoiler=has_media_spoiler(message)
+            file=handle, spoiler=media_spoiler(message, effects)
         )
     return types.InputMediaUploadedDocument(
         file=handle,
         mime_type=message.file.mime_type if message.file else "application/octet-stream",
         attributes=list(getattr(message.document, "attributes", None) or []),
-        spoiler=has_media_spoiler(message),
+        spoiler=media_spoiler(message, effects),
     )
 
 
@@ -2836,6 +3111,7 @@ async def clone_one_post(
     number: int,
     batch: Sequence[Message],
     id_map: dict[int, int],
+    effects: GenEffects | None = None,
 ) -> ClonedPost:
     """Recreate one numbered post, trying progressively weaker copies.
 
@@ -2850,13 +3126,23 @@ async def clone_one_post(
         for message in batch
         for entity in message.entities or []
     )
+    # A watermark changes the image bytes, so those posts can only go out the
+    # re-upload way; the reuse-the-file way cannot stamp anything.
+    must_reupload = bool(
+        effects and effects.watermark and any(message.photo for message in batch)
+    )
     # (label, re-upload the media, keep premium emoji)
-    attempts: list[tuple[str, bool, bool]] = [("as is", False, True)]
-    if premium:
-        attempts.append(("without premium emoji", False, False))
-    attempts.append(("re-uploaded", True, True))
-    if premium:
-        attempts.append(("re-uploaded without premium emoji", True, False))
+    if must_reupload:
+        attempts: list[tuple[str, bool, bool]] = [("watermarked", True, True)]
+        if premium:
+            attempts.append(("watermarked without premium emoji", True, False))
+    else:
+        attempts = [("as is", False, True)]
+        if premium:
+            attempts.append(("without premium emoji", False, False))
+        attempts.append(("re-uploaded", True, True))
+        if premium:
+            attempts.append(("re-uploaded without premium emoji", True, False))
 
     # The newest message of the clone known before this post: whatever arrives
     # after it can only be this post.
@@ -2894,14 +3180,14 @@ async def clone_one_post(
             if reupload:
                 with tempfile.TemporaryDirectory(prefix="clone-") as temp_dir:
                     medias = [
-                        await reuploaded_media(client, message, Path(temp_dir))
+                        await reuploaded_media(client, message, Path(temp_dir), effects)
                         for message in batch
                     ]
                     sent = await send_clone_batch(
                         client, target, batch, medias, id_map, entity_lists
                     )
             else:
-                medias = [clone_input_media(message) for message in batch]
+                medias = [clone_input_media(message, effects) for message in batch]
                 sent = await send_clone_batch(
                     client, target, batch, medias, id_map, entity_lists
                 )
@@ -2972,20 +3258,30 @@ async def copy_chat_about(
 
 
 async def copy_chat_photo(
-    client: TelegramClient, source: ChatEntity, target: types.Channel
+    client: TelegramClient,
+    source: ChatEntity,
+    target: types.Channel,
+    photo_path: str | None = None,
 ) -> bool:
-    """Give the clone the source's profile photo, leaving no service message.
+    """Give the clone a profile photo, leaving no service message.
 
-    Telegram announces a photo change with a "channel photo updated" service
-    message, which is deleted so it does not sit among the cloned posts.
+    With photo_path, that file is used, which is how .gen gives each copy a
+    random demo photo saved with .save dps. Otherwise the source's own photo is
+    copied. Telegram announces a photo change with a "channel photo updated"
+    service message, which is deleted so it does not sit among the cloned posts.
     """
     with tempfile.TemporaryDirectory(prefix="clone-photo-") as temp_dir:
-        path = await retry_on_wait(
-            client.download_profile_photo,
-            source,
-            file=str(Path(temp_dir) / "photo.jpg"),
-            download_big=True,
-        )
+        if photo_path and os.path.isfile(photo_path):
+            path: str | None = photo_path
+        else:
+            if photo_path:
+                warning(f"Saved demo photo {photo_path} is missing; using the source's.")
+            path = await retry_on_wait(
+                client.download_profile_photo,
+                source,
+                file=str(Path(temp_dir) / "photo.jpg"),
+                download_big=True,
+            )
         if not path:
             info("The source has no profile photo to copy.")
             return False
@@ -3181,6 +3477,8 @@ async def clone_into(
     target: types.Channel,
     plan: ClonePlan,
     status: Callable[[str], Awaitable[None]],
+    effects: GenEffects | None = None,
+    profile_photo: str | None = None,
 ) -> CloneOutcome:
     """Make target an exact copy of source, posted by this account.
 
@@ -3196,7 +3494,7 @@ async def clone_into(
     posts = plan.posts
 
     try:
-        if await copy_chat_photo(client, source, target):
+        if await copy_chat_photo(client, source, target, profile_photo):
             outcome.details.append("profile photo")
     except Exception as exc:  # noqa: BLE001
         warning(f"Could not copy the profile photo: {exc}")
@@ -3222,7 +3520,7 @@ async def clone_into(
     await status(f"Copying {len(posts)} post(s)...")
 
     for number, batch in enumerate(posts, start=1):
-        result = await clone_one_post(client, target, number, batch, id_map)
+        result = await clone_one_post(client, target, number, batch, id_map, effects)
         results.append(result)
         for source_message, new_message in zip(batch, result.sent, strict=False):
             if links.present_in(source_message):

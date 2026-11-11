@@ -1924,6 +1924,7 @@ async def command_gen(
     info(f"{name}: {len(plan.posts)} post(s) per copy, {count} copy(ies) to make.")
 
     me = await client.get_me()
+    effects = state.gen_effects()
     made: list[MadeChat] = []
     refused: list[tuple[str, str]] = []  # Workers set aside during this run.
     stopped = ""
@@ -1935,7 +1936,8 @@ async def command_gen(
 
         try:
             result = await _gen_once(
-                client, me.id, state, api_id, api_hash, source, plan, status, refused
+                client, me.id, state, api_id, api_hash, source, plan, status, refused,
+                effects,
             )
         except OperatorBlocked as exc:
             stopped = f"your own account: {exc}"
@@ -1989,6 +1991,7 @@ async def _gen_once(
     plan: ClonePlan,
     status: Callable[[str], Awaitable[None]],
     refused: list[tuple[str, str]],
+    effects: GenEffects | None = None,
 ) -> MadeChat | None:
     """Make one copy, moving on to another worker while any are left.
 
@@ -2005,7 +2008,7 @@ async def _gen_once(
         try:
             made = await make_one_copy(
                 client, operator_id, worker, api_id, api_hash, source, plan, status,
-                effects=state.gen_effects(), dp_path=state.pick_dp(),
+                effects=effects or state.gen_effects(), dp_path=state.pick_dp(),
             )
         except OperatorBlocked:
             raise

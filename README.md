@@ -276,6 +276,7 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 ```text
 .set [link]            choose the demo channel (send it in the channel)
 .gen [count]           make copies of the demo channel
+.upgrade [link]        wipe a copy and rebuild it with the current options
 .login [phone]         add a worker account (phone, code, 2FA)
 .accounts              list the workers and the demo channel
 .save dps              send 6 photos; each copy gets one as its PFP
@@ -336,6 +337,24 @@ Four extras make every `.gen` copy look different from the demo channel and from
 - **`.spoiler`.** On by default: every photo is sent with its image hidden behind a tap, while the caption stays visible. Turn it off to send photos shown (a photo the demo channel itself marked as a spoiler stays a spoiler either way).
 
 `.accounts` shows the current state of all four. The settings live in `automaker_state.json`, so they survive a restart.
+
+## `.upgrade`: rebuild an older copy
+
+```text
+.upgrade https://t.me/+AbCdEf     # by its invite link (also @handle, t.me/c/... or the -100 id from .ids)
+.upgrade                          # or send it inside the copy itself
+```
+
+`.upgrade` brings a copy made earlier up to date with everything `.gen` does now. It **deletes every message in the copy**, then copies the demo channel into it again with the current options: a new tagged title (`Demos - #k7f2q`), a random saved demo photo, the watermark, spoilers, scrambled photo posts and `.fun` if it is on. The demo channel's current posts are what go in, so posts added to the demo since the copy was made come along too.
+
+The channel itself stays: its members, its admins (your account, the worker and the admin bot) and its invite links all keep working. Only the content is replaced.
+
+- Before anything is deleted, it checks that your account is an admin of the copy with the rights to delete, post and change info, and that the demo channel can be read. If either fails, it says so and **nothing is deleted**.
+- If any post in the copy refuses to delete, nothing new is posted, so old and new posts are never mixed. Delete the leftovers by hand and run it again.
+- It never touches the demo channel set with `.set`.
+- Sent inside the copy, the command is removed straight away and the progress goes to your Saved Messages.
+- It spends no worker: your account does all of it.
+- The report ends with the copy's existing invite link when the copy was made by `.gen`.
 
 ## When something goes wrong
 

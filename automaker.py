@@ -64,6 +64,7 @@ from main import (
     channel_from_updates,
     clone_into,
     collect_clone_posts,
+    delete_recent_service,
     failure,
     info,
     is_supported_chat,
@@ -71,6 +72,7 @@ from main import (
     message_text,
     report_gate,
     resolve_clone_source,
+    retry_on_wait,
     set_status,
     success,
     transform_plan,
@@ -1171,6 +1173,192 @@ async def command_delete(
         lines.append("No worker made it, so no worker was freed.")
     success(" ".join(lines))
     await set_fancy(event, "\n".join(lines), done=True)
+
+
+UPGRADE_ID_RE = re.compile(r"^-100(?P<id>\d+)$")
+DELETE_CHUNK = 100
+DELETE_PAUSE = 0.5
+TITLE_ACTIONS = (types.MessageActionChatEditTitle,)
+
+
+async def upgrade_target(
+    client: TelegramClient, event: Any, args: list[str]
+) -> types.Channel:
+    """Return the copy .upgrade works on, as this account sees it."""
+    if args:
+        bare = UPGRADE_ID_RE.match(args[0])
+        if bare:
+            chat = await client.get_entity(types.PeerChannel(int(bare.group("id"))))
+        elif looks_like_chat_reference(args[0]):
+            chat = await resolve_clone_source(client, args[0])
+        else:
+            raise RuntimeError(f"{args[0]} is not a channel link, invite, @handle or -100 id")
+    elif getattr(event, "is_private", False):
+        raise RuntimeError("send .upgrade inside the copy, or .upgrade <link to it>")
+    else:
+        chat = await event.get_chat()
+    if not isinstance(chat, types.Channel):
+        raise RuntimeError("that is not a channel or group")
+    fresh = await client.get_entity(types.PeerChannel(chat.id))
+    return fresh if isinstance(fresh, types.Channel) else chat
+
+
+def upgrade_refusal(channel: types.Channel) -> str:
+    """Say why this account cannot rebuild the channel, or "" when it can."""
+    if channel.creator:
+        return ""
+    rights = channel.admin_rights
+    if rights is None:
+        return "your account is not an admin there"
+    if not rights.delete_messages:
+        return "your account cannot delete messages there"
+    if not channel.megagroup and not rights.post_messages:
+        return "your account cannot post there"
+    if not rights.change_info:
+        return "your account cannot change its name and photo there"
+    return ""
+
+
+async def clear_channel(client: TelegramClient, channel: types.Channel) -> tuple[int, int]:
+    """Delete every message in a channel. Returns (deleted, posts still left).
+
+    Service lines such as "channel created" are removed too where Telegram
+    allows it; the first one usually cannot be deleted, which is harmless, so
+    only real posts count as left over.
+    """
+    posts: list[int] = []
+    service: list[int] = []
+    async for message in client.iter_messages(channel):
+        (service if message.action is not None else posts).append(message.id)
+    for start in range(0, len(posts), DELETE_CHUNK):
+        await retry_on_wait(client.delete_messages, channel, posts[start : start + DELETE_CHUNK])
+        await asyncio.sleep(DELETE_PAUSE)
+    for start in range(0, len(service), DELETE_CHUNK):
+        with contextlib.suppress(Exception):
+            await retry_on_wait(
+                client.delete_messages, channel, service[start : start + DELETE_CHUNK]
+            )
+    left = 0
+    async for message in client.iter_messages(channel):
+        if message.action is None:
+            left += 1
+    return len(posts), left
+
+
+async def retitle(client: TelegramClient, channel: types.Channel, title: str) -> bool:
+    """Rename a channel, leaving no "title changed" line behind."""
+    try:
+        await retry_on_wait(
+            client, functions.channels.EditTitleRequest(channel=channel, title=title)
+        )
+    except errors.ChatNotModifiedError:
+        return False
+    await delete_recent_service(client, channel, TITLE_ACTIONS)
+    return True
+
+
+async def command_upgrade(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """Rebuild an existing copy with everything .gen does today.
+
+    Every message in the copy is deleted, then the demo channel is copied in
+    again with the current options: a tagged title, a saved demo photo, the
+    watermark, spoilers, scrambled photo posts and .fun. The channel, its
+    members, its admins and its invite links all stay; only the content is
+    replaced. The demo is read and the rights checked before anything is
+    deleted, so a refusal never leaves the copy empty.
+    """
+    try:
+        target = await upgrade_target(client, event, args)
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc) if isinstance(exc, RuntimeError) else short_error(exc)
+        await set_status(event, f"Cannot .upgrade: {reason}")
+        return
+    demo_refusal = "That is the demo channel set with .set; .upgrade only rebuilds copies."
+    if state.source_id is not None and target.id == utils.resolve_id(state.source_id)[0]:
+        await set_status(event, demo_refusal)
+        return
+
+    old_title = utils.get_display_name(target) or str(target.id)
+    if event.chat_id == utils.get_peer_id(target):
+        with contextlib.suppress(Exception):
+            await event.delete()
+        where = "me" if getattr(event, "out", False) else event.sender_id
+        status_message = await client.send_message(where, f".upgrade: {old_title}", **PLAIN)
+        event = StatusElsewhere(event, status_message)
+
+    refusal = upgrade_refusal(target)
+    if refusal:
+        await set_status(event, f"Cannot upgrade {old_title}: {refusal}. Nothing was deleted.")
+        return
+    try:
+        source = await resolve_source(client, state)
+    except RuntimeError as exc:
+        await set_status(event, f"Cannot upgrade {old_title}: {exc}. Nothing was deleted.")
+        return
+    if source.id == target.id:
+        await set_status(event, demo_refusal)
+        return
+
+    async def status(text: str) -> None:
+        await set_fancy(event, f"Upgrading {old_title}: {text}")
+
+    await status(f"reading {utils.get_display_name(source)}...")
+    plan = await collect_clone_posts(client, source, command_id=event.id)
+    if not plan.posts:
+        await set_status(event, f"The demo channel has no posts, so {old_title} was left as it is.")
+        return
+
+    await status("deleting every message...")
+    try:
+        deleted, left = await clear_channel(client, target)
+    except Exception as exc:  # noqa: BLE001
+        failure(f".upgrade could not empty {old_title}: {exc}")
+        await set_status(event, f"Could not empty {old_title}: {short_error(exc)}. Check it by hand.")
+        return
+    if left:
+        await set_status(
+            event,
+            f"{left} post(s) in {old_title} could not be deleted, so nothing new was "
+            "posted. Delete them by hand and run .upgrade again.",
+        )
+        return
+    info(f".upgrade: deleted {deleted} message(s) from {old_title}.")
+
+    title = tagged_title(utils.get_display_name(source) or old_title)
+    try:
+        await retitle(client, target, title)
+    except Exception as exc:  # noqa: BLE001
+        warning(f".upgrade could not rename {old_title}: {exc}")
+        title = old_title
+
+    effects = state.gen_effects()
+    use_plan = transform_plan(plan, effects, random.Random())
+    outcome = await clone_into(
+        client, source, target, use_plan, status,
+        effects=effects, profile_photo=state.pick_dp(),
+    )
+
+    record = next(
+        (item for worker in state.workers for item in worker.made if item.get("chat_id") == target.id),
+        None,
+    )
+    if record is not None:
+        record.update(
+            title=title, copied=outcome.copied, total=outcome.total, upgraded_at=now_stamp()
+        )
+        state.save()
+
+    lines = [
+        f"Upgraded {old_title}" + (f" -> {title}" if title != old_title else ""),
+        f"Deleted {deleted} old message(s), then copied the demo again.",
+        *outcome.lines(),
+    ]
+    if record is not None and record.get("link"):
+        lines.append(f"Invite link unchanged: {record['link']}")
+    success(lines[0])
+    await set_fancy(event, "\n".join(lines), done=outcome.ok)
 
 
 async def command_login(
@@ -2479,6 +2667,7 @@ COMMAND_HELP = (
     ".set [link]            choose the demo channel (send it in the channel)\n"
     ".gen [count]           make copies of the demo channel\n"
     ".delete [link]         delete a copy, free its worker (not the demo)\n"
+    ".upgrade [link]        wipe a copy and rebuild it with the current options\n"
     ".login [phone]         add a worker account (phone, code, 2FA)\n"
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
@@ -2505,6 +2694,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "session": command_session,
     "gen": command_gen,
     "delete": command_delete,
+    "upgrade": command_upgrade,
     "accounts": command_accounts,
     "ids": command_ids,
     "save": command_save,
@@ -2573,7 +2763,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
             if name in {"login", "session", "save"}:
                 awaiting.add(event.chat_id)
             try:
-                if name in {"set", "gen", "delete"}:
+                if name in {"set", "gen", "delete", "upgrade"}:
                     event = await keep_out_of_source(client, state, event, name, args)
                 if name in WITH_CREDENTIALS:
                     await handler(client, state, event, args, api_id, api_hash)

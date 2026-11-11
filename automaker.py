@@ -60,6 +60,7 @@ from main import (
     PLAIN,
     ClonePlan,
     CommandGate,
+    GenEffects,
     channel_from_updates,
     clone_into,
     collect_clone_posts,
@@ -72,6 +73,7 @@ from main import (
     resolve_clone_source,
     set_status,
     success,
+    transform_plan,
     warning,
 )
 
@@ -90,6 +92,14 @@ DEFAULT_ADMIN_BOT = "DemoSaviourBot"
 ADMIN_BOT = (
     (os.getenv("AUTOMAKER_ADMIN_BOT") or "").strip().lstrip("@") or DEFAULT_ADMIN_BOT
 )
+DEFAULT_WATERMARK = "Your Pleasure Is Not A Sin"
+WATERMARK_TEXT = (
+    os.getenv("AUTOMAKER_WATERMARK")
+    if os.getenv("AUTOMAKER_WATERMARK") is not None
+    else DEFAULT_WATERMARK
+).strip()
+DP_DIR = Path((os.getenv("AUTOMAKER_DP_DIR") or "automaker_dps").strip())
+DP_COUNT = 6
 CODE_ATTEMPTS = 3
 PASSWORD_ATTEMPTS = 3
 
@@ -399,6 +409,9 @@ class AutoState:
     source_id: int | None = None
     source_title: str = ""
     permitted: list[dict[str, Any]] = field(default_factory=list)
+    dp_photos: list[str] = field(default_factory=list)
+    fun: bool = False
+    spoiler: bool = True
 
     @classmethod
     def load(cls, path: str | Path = STATE_FILE) -> AutoState:
@@ -424,6 +437,10 @@ class AutoState:
             for item in raw.get("permitted") or []
             if isinstance(item, dict) and item.get("user_id")
         ]
+        options = raw.get("options") or {}
+        state.dp_photos = [str(path) for path in options.get("dp_photos") or []]
+        state.fun = bool(options.get("fun", False))
+        state.spoiler = bool(options.get("spoiler", True))
         return state
 
     def save(self) -> None:
@@ -437,6 +454,11 @@ class AutoState:
             "workers": [worker.to_json() for worker in self.workers],
             "source": {"chat_id": self.source_id, "title": self.source_title},
             "permitted": self.permitted,
+            "options": {
+                "dp_photos": self.dp_photos,
+                "fun": self.fun,
+                "spoiler": self.spoiler,
+            },
         }
         directory = self.path.parent if str(self.path.parent) else Path(".")
         directory.mkdir(parents=True, exist_ok=True)
@@ -452,6 +474,20 @@ class AutoState:
             with contextlib.suppress(OSError):
                 os.unlink(temporary)
             raise
+
+    def gen_effects(self) -> GenEffects:
+        """Build the per-copy effects from the current options."""
+        return GenEffects(
+            spoiler=self.spoiler,
+            watermark=WATERMARK_TEXT or None,
+            fun=self.fun,
+            scramble=True,
+        )
+
+    def pick_dp(self) -> str | None:
+        """Return a random saved demo photo that still exists on disk."""
+        existing = [path for path in self.dp_photos if os.path.isfile(path)]
+        return random.choice(existing) if existing else None
 
     def find(self, name: str) -> Worker | None:
         """Return a worker by its short name, or by the account's own name.
@@ -913,6 +949,8 @@ async def make_one_copy(
     source: types.Channel,
     plan: ClonePlan,
     status: Callable[[str], Awaitable[None]],
+    effects: GenEffects | None = None,
+    dp_path: str | None = None,
 ) -> MadeChat:
     """Have one worker create the channel, then copy the demo channel into it.
 
@@ -946,7 +984,11 @@ async def make_one_copy(
     # channel exists and the worker's quota is spent, so whatever happens next
     # is reported with the link rather than thrown away.
     try:
-        outcome = await clone_into(operator, source, target, plan, status)
+        use_plan = transform_plan(plan, effects, random.Random()) if effects else plan
+        outcome = await clone_into(
+            operator, source, target, use_plan, status,
+            effects=effects, profile_photo=dp_path,
+        )
         copied, total, report = outcome.copied, outcome.total, outcome.lines()
     except Exception as exc:  # noqa: BLE001
         failure(f"The copy into {title!r} stopped early: {exc}")
@@ -1310,6 +1352,111 @@ async def _store_worker(
     )
 
 
+async def collect_demo_photos(convo: Conversation) -> list[str]:
+    """Read DP_COUNT photos the operator sends, and save them to DP_DIR.
+
+    Only photos count; a text message that is not .cancel is answered with a
+    reminder and does not use up a slot.
+    """
+    DP_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in DP_DIR.glob("dp*.jpg"):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+    saved: list[str] = []
+    while len(saved) < DP_COUNT:
+        await convo.say(
+            f"Send demo photo {len(saved) + 1} of {DP_COUNT} as a photo.\n\n"
+            "One at a time, or .cancel to stop."
+        )
+        try:
+            answer = await asyncio.wait_for(convo.queue.get(), ASK_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise LoginAborted(
+                f"nothing was sent for {int(ASK_TIMEOUT)}s, so .save stopped"
+            ) from exc
+        if message_text(answer).strip().lower() in CANCEL_WORDS:
+            raise LoginAborted("cancelled")
+        if not getattr(answer, "photo", None):
+            await convo.say("That was not a photo. Send a photo, or .cancel to stop.")
+            continue
+        path = str(DP_DIR / f"dp{len(saved) + 1}.jpg")
+        await answer.download_media(file=path)
+        saved.append(path)
+    return saved
+
+
+async def command_save(
+    client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """.save dps: collect demo profile photos .gen picks from at random."""
+    what = args[0].lower() if args else "dps"
+    if what not in {"dps", "dp", "pfp"}:
+        await set_status(event, "Usage: .save dps   then send 6 photos one by one.")
+        return
+    try:
+        async with Conversation(client, event) as convo:
+            saved = await collect_demo_photos(convo)
+    except LoginAborted as exc:
+        await set_status(event, f".save stopped: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        failure(f".save failed: {exc}")
+        await set_status(event, f".save failed: {short_error(exc)}")
+        return
+    state.dp_photos = saved
+    state.save()
+    success(f"Saved {len(saved)} demo photo(s) in {DP_DIR}.")
+    await set_fancy(
+        event,
+        f"Saved {len(saved)} demo photos. Each .gen copy now gets one at random "
+        "as its profile photo.",
+        done=True,
+    )
+
+
+async def command_fun(
+    _client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """.fun on|off: readable letter swaps in captions and text posts."""
+    choice = args[0].lower() if args else ("off" if state.fun else "on")
+    if choice not in {"on", "off"}:
+        await set_status(event, "Usage: .fun on   or   .fun off")
+        return
+    state.fun = choice == "on"
+    state.save()
+    await set_fancy(
+        event,
+        "Fun is ON: each copy swaps some letters (a->@, i->!) in captions and "
+        "text posts, differently every time."
+        if state.fun
+        else "Fun is OFF: captions and text are copied as they are.",
+        done=True,
+        icon="settings",
+    )
+
+
+async def command_spoiler(
+    _client: TelegramClient, state: AutoState, event: Any, args: list[str]
+) -> None:
+    """.spoiler on|off: send every photo hidden behind a tap (default on)."""
+    choice = args[0].lower() if args else ("off" if state.spoiler else "on")
+    if choice not in {"on", "off"}:
+        await set_status(event, "Usage: .spoiler on   or   .spoiler off")
+        return
+    state.spoiler = choice == "on"
+    state.save()
+    await set_fancy(
+        event,
+        "Spoiler is ON: every photo is sent hidden behind a tap; captions stay "
+        "visible."
+        if state.spoiler
+        else "Spoiler is OFF: photos are sent shown, unless the source hid them.",
+        done=True,
+        icon="settings",
+    )
+
+
 async def command_accounts(
     _client: TelegramClient, state: AutoState, event: Any, _args: list[str]
 ) -> None:
@@ -1332,6 +1479,13 @@ async def command_accounts(
             f"{aside} set aside. .reset all retries them; .remove aside forgets them."
         )
     lines.append(f"Demo channel: {state.source_title or 'none yet, send .set in it'}")
+    dp_count = len([p for p in state.dp_photos if os.path.isfile(p)])
+    lines.append(
+        f"Demo photos: {dp_count or 'none (.save dps)'}  |  "
+        f"fun: {'on' if state.fun else 'off'}  |  "
+        f"spoiler: {'on' if state.spoiler else 'off'}  |  "
+        f"watermark: {WATERMARK_TEXT or 'off'}"
+    )
     await set_status(event, "\n".join(lines), "users")
 
 
@@ -1850,7 +2004,8 @@ async def _gen_once(
             return None
         try:
             made = await make_one_copy(
-                client, operator_id, worker, api_id, api_hash, source, plan, status
+                client, operator_id, worker, api_id, api_hash, source, plan, status,
+                effects=state.gen_effects(), dp_path=state.pick_dp(),
             )
         except OperatorBlocked:
             raise
@@ -2304,6 +2459,9 @@ COMMAND_HELP = (
     ".session [string]      add a worker from a session string (no code)\n"
     ".accounts              list the workers and the demo channel\n"
     ".ids [all]             IDs of finished, live copies (all = with dead)\n"
+    ".save dps              send 6 photos; each copy gets one as its PFP\n"
+    ".fun [on|off]          readable letter swaps in captions/text per copy\n"
+    ".spoiler [on|off]      send photos hidden behind a tap (default on)\n"
     ".permit [@user|list]   make them admin when they join (send in their DM)\n"
     ".unpermit [@user|id]   stop doing that for them\n"
     ".autodel [on|off|...]  delete quick replies 1-2 h after sending\n"
@@ -2325,6 +2483,9 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "delete": command_delete,
     "accounts": command_accounts,
     "ids": command_ids,
+    "save": command_save,
+    "fun": command_fun,
+    "spoiler": command_spoiler,
     "autodel": command_autodel_auto,
     "reset": command_reset,
     "remove": command_remove,
@@ -2385,7 +2546,7 @@ async def run_auto_maker(client: TelegramClient, api_id: int, api_hash: str) -> 
 
         args = raw_args.split() if raw_args else []
         async with busy:
-            if name in {"login", "session"}:
+            if name in {"login", "session", "save"}:
                 awaiting.add(event.chat_id)
             try:
                 if name in {"set", "gen", "delete"}:

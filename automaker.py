@@ -92,6 +92,14 @@ DEFAULT_ADMIN_BOT = "DemoSaviourBot"
 ADMIN_BOT = (
     (os.getenv("AUTOMAKER_ADMIN_BOT") or "").strip().lstrip("@") or DEFAULT_ADMIN_BOT
 )
+# Every copy's title ends in a tag of its own, so "Demos" becomes
+# "Demos - #k7f2q". AUTOMAKER_TITLE_TAG=off keeps the demo channel's own title.
+TITLE_TAG_LENGTH = 5
+TITLE_TAG_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+TITLE_TAG_ON = (os.getenv("AUTOMAKER_TITLE_TAG") or "on").strip().lower() not in {
+    "off", "no", "0", "false", "none",
+}
+TITLE_LIMIT = 128  # Telegram refuses a longer chat title.
 DEFAULT_WATERMARK = "Your Pleasure Is Not A Sin"
 WATERMARK_TEXT = (
     os.getenv("AUTOMAKER_WATERMARK")
@@ -316,6 +324,19 @@ def full_rights(megagroup: bool) -> types.ChatAdminRights:
         delete_stories=True,
         other=True,
     )
+
+
+def tagged_title(title: str) -> str:
+    """Return the demo channel's title with a random tag of its own.
+
+    "Demos" becomes "Demos - #k7f2q", a different tag for every copy, so the
+    copies are told apart at a glance and no two share a name.
+    """
+    if not TITLE_TAG_ON:
+        return title[:TITLE_LIMIT]
+    code = "".join(random.choice(TITLE_TAG_ALPHABET) for _ in range(TITLE_TAG_LENGTH))
+    suffix = f" - #{code}"
+    return f"{title[: TITLE_LIMIT - len(suffix)].rstrip()}{suffix}"
 
 
 def permit_rights(megagroup: bool) -> types.ChatAdminRights:
@@ -959,7 +980,7 @@ async def make_one_copy(
     when it is not. Either way, a channel that was created but never got its
     copy is deleted again.
     """
-    title = utils.get_display_name(source) or "Copy"
+    title = tagged_title(utils.get_display_name(source) or "Copy")
     client = await worker_client(worker, api_id, api_hash)
     channel: types.Channel | None = None
     try:

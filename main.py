@@ -2342,12 +2342,14 @@ class GenEffects:
     fun       readable letter swaps in captions and text posts (a to @, i to !).
     scramble  photo posts are shuffled among themselves; text, link and sticker
               posts keep their place.
+    reactions False turns reactions off in the copy.
     """
 
     spoiler: bool = True
     watermark: str | None = None
     fun: bool = False
     scramble: bool = True
+    reactions: bool = True
     seen_orders: set[tuple[int, ...]] = field(default_factory=set, compare=False, repr=False)
     seen_texts: set[str] = field(default_factory=set, compare=False, repr=False)
 
@@ -2648,7 +2650,7 @@ COMMAND_TRACE_RE = re.compile(
 DOT_COMMAND_RE = re.compile(
     r"^\.(?:clone|change|help|allow|deny|admins"
     r"|set|gen|login|accounts|reset|remove|cancel"
-    r"|upgrade|delete|save|fun|spoiler|permit|unpermit|ids|session|terminate|autodel)\b[^\n]*$"
+    r"|upgrade|delete|save|fun|spoiler|reactions|permit|unpermit|ids|session|terminate|autodel)\b[^\n]*$"
 )
 
 

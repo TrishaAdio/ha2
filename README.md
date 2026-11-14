@@ -282,6 +282,7 @@ Mode 3 makes fresh copies of one **demo channel** on demand. Your signed-in (pre
 .save dps              send 6 photos; each copy gets one as its PFP
 .fun [on|off]          readable letter swaps in captions/text per copy
 .spoiler [on|off]      send photos hidden behind a tap (default on)
+.reactions [on|off]    reactions in every copy, now and in new ones
 .permit [@user|list]   make them admin when they join (send in their DM)
 .unpermit [@user|id]   stop doing that for them
 .reset [name|all]      free spent and set-aside workers
@@ -337,6 +338,22 @@ Four extras make every `.gen` copy look different from the demo channel and from
 - **`.spoiler`.** On by default: every photo is sent with its image hidden behind a tap, while the caption stays visible. Turn it off to send photos shown (a photo the demo channel itself marked as a spoiler stays a spoiler either way).
 
 `.accounts` shows the current state of all four. The settings live in `automaker_state.json`, so they survive a restart.
+
+## `.reactions`
+
+```text
+.reactions off     # no reactions in any copy, now and from now on
+.reactions on      # every reaction allowed again
+.reactions         # show the current setting
+```
+
+`.reactions off` goes through every copy `.gen` has made and switches reactions off, then remembers the choice, so every copy made afterwards by `.gen` or rebuilt by `.upgrade` starts with reactions off too. `.reactions on` allows every reaction again (custom emoji reactions too where the channel may have them) in the existing copies and the new ones.
+
+- Your account changes each copy. If it is refused in one, the worker that owns that copy does it instead.
+- Copies that were deleted, or that you were removed from, are skipped and counted as gone, not as failures.
+- Anything that still could not be changed is listed by name in the reply.
+- The demo channel itself is left as it is.
+- The setting is kept in the state file and shown in `.accounts`. Reactions stay on until you send `.reactions off`.
 
 ## `.upgrade`: rebuild an older copy
 

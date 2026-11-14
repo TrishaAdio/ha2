@@ -58,6 +58,7 @@ from main import (
     COMMAND_PATTERN,
     GATE_HELP,
     PLAIN,
+    STATUS_EVERY,
     ClonePlan,
     CommandGate,
     GenEffects,
@@ -435,6 +436,7 @@ class AutoState:
     dp_photos: list[str] = field(default_factory=list)
     fun: bool = False
     spoiler: bool = True
+    reactions: bool = True
 
     @classmethod
     def load(cls, path: str | Path = STATE_FILE) -> AutoState:
@@ -464,6 +466,7 @@ class AutoState:
         state.dp_photos = [str(path) for path in options.get("dp_photos") or []]
         state.fun = bool(options.get("fun", False))
         state.spoiler = bool(options.get("spoiler", True))
+        state.reactions = bool(options.get("reactions", True))
         return state
 
     def save(self) -> None:
@@ -481,6 +484,7 @@ class AutoState:
                 "dp_photos": self.dp_photos,
                 "fun": self.fun,
                 "spoiler": self.spoiler,
+                "reactions": self.reactions,
             },
         }
         directory = self.path.parent if str(self.path.parent) else Path(".")
@@ -505,6 +509,7 @@ class AutoState:
             watermark=WATERMARK_TEXT or None,
             fun=self.fun,
             scramble=True,
+            reactions=self.reactions,
         )
 
     def pick_dp(self) -> str | None:
@@ -1002,6 +1007,9 @@ async def make_one_copy(
     finally:
         await client.disconnect()
     await drop_join_notice(operator, target)
+    reactions_note = ""
+    if effects is not None and not effects.reactions:
+        reactions_note = await reactions_off_in_new(operator, target)
 
     # From here on the operator does every write, and the worker is done. The
     # channel exists and the worker's quota is spent, so whatever happens next
@@ -1022,6 +1030,8 @@ async def make_one_copy(
     except Exception as exc:  # noqa: BLE001
         failure(f"Could not export an invite link for {title!r}: {exc}")
         link = f"(no invite link: {exc}; export one in the channel's settings)"
+    if reactions_note:
+        report = [reactions_note, *report]
     if bot_note:
         report = [bot_note, *report]
     return MadeChat(
@@ -1173,6 +1183,142 @@ async def command_delete(
         lines.append("No worker made it, so no worker was freed.")
     success(" ".join(lines))
     await set_fancy(event, "\n".join(lines), done=True)
+
+
+REACTIONS_PAUSE = 0.5
+GONE_ERRORS = (errors.ChannelPrivateError, errors.ChannelInvalidError)
+
+
+async def set_reactions(client: TelegramClient, channel: Any, enabled: bool) -> bool:
+    """Turn every reaction on or off in a channel. Returns whether it changed.
+
+    Off is "no reactions at all". On allows every reaction, custom emoji
+    reactions included where Telegram lets the channel have them, and plain
+    ones otherwise.
+    """
+    if enabled:
+        choices: list[Any] = [
+            types.ChatReactionsAll(allow_custom=True),
+            types.ChatReactionsAll(allow_custom=False),
+        ]
+    else:
+        choices = [types.ChatReactionsNone()]
+    refused: Exception | None = None
+    for available in choices:
+        try:
+            await retry_on_wait(
+                client,
+                functions.messages.SetChatAvailableReactionsRequest(
+                    peer=channel, available_reactions=available
+                ),
+            )
+            return True
+        except errors.ChatNotModifiedError:
+            return False
+        except errors.ReactionInvalidError as exc:
+            refused = exc
+    raise refused or RuntimeError("Telegram refused every reaction setting")
+
+
+async def reactions_off_in_new(client: TelegramClient, channel: types.Channel) -> str:
+    """Switch reactions off in a copy being made, as a line for its report."""
+    try:
+        await set_reactions(client, channel, False)
+    except Exception as exc:  # noqa: BLE001  Report it, keep the copy.
+        warning(f"Could not turn reactions off: {short_error(exc)}")
+        return f"Reactions could NOT be turned off: {short_error(exc)}"
+    return "Reactions: off"
+
+
+async def set_reactions_by_worker(
+    owner: Worker, channel_id: int, enabled: bool, api_id: int, api_hash: str
+) -> bool:
+    """Have the worker that owns a copy change its reactions."""
+    worker = await worker_client(owner, api_id, api_hash)
+    try:
+        await worker.get_dialogs()
+        channel = await worker.get_input_entity(types.PeerChannel(channel_id))
+        return await set_reactions(worker, channel, enabled)
+    finally:
+        await worker.disconnect()
+
+
+async def command_reactions(
+    client: TelegramClient,
+    state: AutoState,
+    event: Any,
+    args: list[str],
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """.reactions on|off: in every copy now, and in every copy made from now on."""
+    choice = args[0].lower() if args else ""
+    if choice not in {"on", "off"}:
+        await set_status(
+            event,
+            f"Reactions are {'on' if state.reactions else 'off'} for new copies.\n"
+            "Usage: .reactions off   or   .reactions on",
+        )
+        return
+    state.reactions = choice == "on"
+    state.save()
+
+    copies: dict[int, tuple[Worker, str]] = {}
+    for worker in state.workers:
+        for item in worker.made:
+            if item.get("chat_id"):
+                copies[int(item["chat_id"])] = (worker, str(item.get("title") or item["chat_id"]))
+    future = (
+        "New copies keep reactions on."
+        if state.reactions
+        else "Every new copy from .gen or .upgrade has reactions off."
+    )
+    if not copies:
+        await set_fancy(event, f"Reactions {choice}. No copies exist yet. {future}", done=True, icon="settings")
+        return
+
+    await set_fancy(event, f"Turning reactions {choice} in {len(copies)} cop{'y' if len(copies) == 1 else 'ies'}...")
+    alive: dict[int, types.Channel] = {}
+    async for dialog in client.iter_dialogs():
+        if isinstance(dialog.entity, types.Channel):
+            alive[dialog.entity.id] = dialog.entity
+
+    changed = already = gone = 0
+    failed: list[str] = []
+    for done, (channel_id, (owner, title)) in enumerate(copies.items(), start=1):
+        channel = alive.get(channel_id)
+        if channel is None:
+            gone += 1
+            continue
+        try:
+            did = await set_reactions(client, channel, state.reactions)
+        except GONE_ERRORS:
+            gone += 1
+            continue
+        except Exception as exc:  # noqa: BLE001  The owning worker may still can.
+            warning(f"Your account could not change reactions in {title}: {short_error(exc)}; asking {owner.name}.")
+            try:
+                did = await set_reactions_by_worker(
+                    owner, channel_id, state.reactions, api_id, api_hash
+                )
+            except Exception as worker_exc:  # noqa: BLE001
+                failed.append(f"{title}: {why_unusable(worker_exc)}")
+                continue
+        changed += did
+        already += not did
+        if done % STATUS_EVERY == 0:
+            await set_fancy(event, f"Turning reactions {choice}... {done}/{len(copies)}")
+        await asyncio.sleep(REACTIONS_PAUSE)
+
+    lines = [f"Reactions {choice}: {changed} changed, {already} already {choice}"]
+    if gone:
+        lines.append(f"{gone} cop{'y is' if gone == 1 else 'ies are'} gone (deleted, or you were removed), skipped")
+    if failed:
+        lines.append(f"Could not change {len(failed)}:")
+        lines += [f"  {line}" for line in failed[:10]]
+    lines.append(future)
+    success(lines[0])
+    await set_fancy(event, "\n".join(lines), icon="warn" if failed else "done")
 
 
 UPGRADE_ID_RE = re.compile(r"^-100(?P<id>\d+)$")
@@ -1332,6 +1478,7 @@ async def command_upgrade(
     except Exception as exc:  # noqa: BLE001
         warning(f".upgrade could not rename {old_title}: {exc}")
         title = old_title
+    reactions_note = "" if state.reactions else await reactions_off_in_new(client, target)
 
     effects = state.gen_effects()
     use_plan = transform_plan(plan, effects, random.Random())
@@ -1353,6 +1500,7 @@ async def command_upgrade(
     lines = [
         f"Upgraded {old_title}" + (f" -> {title}" if title != old_title else ""),
         f"Deleted {deleted} old message(s), then copied the demo again.",
+        *([reactions_note] if reactions_note else []),
         *outcome.lines(),
     ]
     if record is not None and record.get("link"):
@@ -1693,6 +1841,7 @@ async def command_accounts(
         f"Demo photos: {dp_count or 'none (.save dps)'}  |  "
         f"fun: {'on' if state.fun else 'off'}  |  "
         f"spoiler: {'on' if state.spoiler else 'off'}  |  "
+        f"reactions: {'on' if state.reactions else 'off'}  |  "
         f"watermark: {WATERMARK_TEXT or 'off'}"
     )
     await set_status(event, "\n".join(lines), "users")
@@ -2675,6 +2824,7 @@ COMMAND_HELP = (
     ".save dps              send 6 photos; each copy gets one as its PFP\n"
     ".fun [on|off]          readable letter swaps in captions/text per copy\n"
     ".spoiler [on|off]      send photos hidden behind a tap (default on)\n"
+    ".reactions [on|off]    reactions in every copy, now and in new ones\n"
     ".permit [@user|list]   make them admin when they join (send in their DM)\n"
     ".unpermit [@user|id]   stop doing that for them\n"
     ".autodel [on|off|...]  delete quick replies 1-2 h after sending\n"
@@ -2687,7 +2837,7 @@ COMMAND_HELP = (
 )
 
 # Commands that need the API credentials to sign in to a worker account.
-WITH_CREDENTIALS = {"login", "session", "gen", "terminate", "delete", "remove"}
+WITH_CREDENTIALS = {"login", "session", "gen", "terminate", "delete", "remove", "reactions"}
 COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "set": command_set,
     "login": command_login,
@@ -2700,6 +2850,7 @@ COMMANDS: dict[str, Callable[..., Awaitable[None]]] = {
     "save": command_save,
     "fun": command_fun,
     "spoiler": command_spoiler,
+    "reactions": command_reactions,
     "autodel": command_autodel_auto,
     "reset": command_reset,
     "remove": command_remove,
